@@ -14,8 +14,9 @@ import requests
 import streamlit as st
 
 
-APP_TITLE = "群星"
+APP_TITLE = "Stellar"
 DATA_FILE = Path("pulse_data.json")
+SUPABASE_TABLE = "stellar_data"
 HERO_IMAGE = Path("assets/fuji-hero.png")
 NIGHT_HERO_IMAGE = Path("assets/fuji-night-stars.png")
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -41,6 +42,9 @@ DEFAULT_DATA = {
 
 
 def load_data() -> dict:
+    remote_data = load_remote_data()
+    if remote_data is not None:
+        return remote_data
     if not DATA_FILE.exists():
         save_data(DEFAULT_DATA)
         return json.loads(json.dumps(DEFAULT_DATA))
@@ -53,8 +57,76 @@ def load_data() -> dict:
 
 
 def save_data(data: dict) -> None:
+    if save_remote_data(data):
+        return
     with DATA_FILE.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_supabase_config() -> tuple[str, str]:
+    url = get_secret_value("SUPABASE_URL").rstrip("/")
+    key = get_secret_value("SUPABASE_SERVICE_ROLE_KEY") or get_secret_value("SUPABASE_ANON_KEY")
+    return url, key
+
+
+def supabase_headers(key: str) -> dict:
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+
+def normalize_data(data: dict | None) -> dict:
+    normalized = json.loads(json.dumps(DEFAULT_DATA))
+    if isinstance(data, dict):
+        for key, value in data.items():
+            normalized[key] = value
+    if "council" not in normalized or not isinstance(normalized["council"], dict):
+        normalized["council"] = json.loads(json.dumps(DEFAULT_DATA["council"]))
+    return normalized
+
+
+def load_remote_data() -> dict | None:
+    url, key = get_supabase_config()
+    if not url or not key:
+        return None
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/{SUPABASE_TABLE}",
+            headers=supabase_headers(key),
+            params={"select": "data", "id": "eq.main"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        if not rows:
+            data = normalize_data(DEFAULT_DATA)
+            save_remote_data(data)
+            return data
+        return normalize_data(rows[0].get("data"))
+    except Exception as exc:
+        st.warning(f"远程数据读取失败，已使用本地数据：{exc}")
+        return None
+
+
+def save_remote_data(data: dict) -> bool:
+    url, key = get_supabase_config()
+    if not url or not key:
+        return False
+    try:
+        response = requests.post(
+            f"{url}/rest/v1/{SUPABASE_TABLE}",
+            headers={**supabase_headers(key), "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={"id": "main", "data": normalize_data(data), "updated_at": datetime.utcnow().isoformat()},
+            timeout=12,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:
+        st.warning(f"远程数据保存失败，已保存到本地：{exc}")
+        return False
 
 
 def image_data_uri(path: Path) -> str:
@@ -583,13 +655,19 @@ def inject_css() -> None:
         }
 
         .landing-shell {
-            min-height: 100vh;
-            margin: -1.2rem calc(50% - 50vw) 0;
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100dvh;
+            margin: 0;
+            overflow: hidden;
         }
 
         .landing-hero {
             position: relative;
-            min-height: 100vh;
+            width: 100%;
+            height: 100%;
+            min-height: 100dvh;
             overflow: hidden;
             background-size: cover;
             background-position: center;
@@ -946,7 +1024,7 @@ def inject_css() -> None:
                 font-size: 36px;
             }
             .landing-hero {
-                min-height: 100vh;
+                min-height: 100dvh;
                 background-position: 58% center;
             }
             .landing-content {
@@ -967,9 +1045,14 @@ def hide_sidebar_for_landing() -> None:
         [data-testid="stSidebar"] {
             display: none;
         }
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+            height: 100dvh;
+            overflow: hidden;
+        }
         .block-container {
-            max-width: 1440px;
-            padding-top: 1.2rem;
+            max-width: none;
+            padding: 0;
+            height: 100dvh;
         }
         </style>
         """,
@@ -1717,6 +1800,7 @@ def render_star_map(data: dict) -> None:
 
 
 def render_star_page(data: dict) -> None:
+    hide_sidebar_for_landing()
     ideas = data["ideas"]
     hero_uri = image_data_uri(NIGHT_HERO_IMAGE)
     selected_id = st.query_params.get("idea", "")
@@ -1727,7 +1811,7 @@ def render_star_page(data: dict) -> None:
         title = idea["title"].replace('"', "&quot;")
         star_links.append(
             f'<a class="sp-star" style="left:{x}%; top:{y}%;" '
-            f'href="?view=stars&idea={idea["id"]}" title="{title}">{title}</a>'
+            f'href="?view=workspace&page=stars&idea={idea["id"]}" title="{title}">{title}</a>'
         )
 
     selected = next((idea for idea in ideas if idea["id"] == selected_id), None)
@@ -1751,15 +1835,23 @@ def render_star_page(data: dict) -> None:
         f"""
         <style>
         .star-shell {{
-            min-height: 100vh;
-            margin: -1.2rem calc(50% - 50vw) 0;
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100dvh;
+            overflow: hidden;
+        }}
+        [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] {{
+            display: none !important;
         }}
         .star-page {{
             position: relative;
-            min-height: 100vh;
+            width: 100%;
+            height: 100%;
+            min-height: 100dvh;
             overflow: hidden;
             background-size: cover;
-            background-position: center;
+            background-position: center bottom;
             color: #f7fbff;
             font-family: inherit;
         }}
@@ -1790,25 +1882,38 @@ def render_star_page(data: dict) -> None:
             color: #d5deed;
             font-size: 15px;
         }}
-        .star-page-back {{
+        .sp-back-form {{
             position: absolute;
-            right: 36px;
-            top: 36px;
+            bottom: 28px;
+            left: 36px;
             z-index: 10;
+            margin: 0;
+            width: auto;
+            height: auto;
+        }}
+        .sp-back-button {{
+            appearance: none;
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            padding: 9px 18px;
+            width: auto;
+            height: auto;
+            min-width: 0;
+            min-height: 0;
+            padding: 9px 16px;
             border-radius: 999px;
             border: 1px solid rgba(255,255,255,0.22);
-            background: rgba(8,13,26,0.55);
+            background: rgba(8,13,26,0.34);
             backdrop-filter: blur(10px);
             color: #f0f6ff;
             font-size: 13px;
             font-weight: 700;
             text-decoration: none;
+            line-height: 1;
+            white-space: nowrap;
+            cursor: pointer;
         }}
-        .star-page-back:hover {{
+        .sp-back-button:hover {{
             background: rgba(94,234,212,0.18);
             border-color: rgba(94,234,212,0.5);
             color: #5eead4;
@@ -1860,6 +1965,25 @@ def render_star_page(data: dict) -> None:
             color: #f7fbff;
             margin: 4px 0 8px;
         }}
+        @media (max-width: 700px) {{
+            .star-page-title {{
+                left: 22px;
+                top: 26px;
+                right: 22px;
+            }}
+            .star-page-title h2 {{
+                font-size: 28px;
+            }}
+            .sp-back-form {{
+                left: 22px;
+                bottom: 22px;
+            }}
+            .star-page-detail {{
+                left: 22px;
+                right: 22px;
+                bottom: 76px;
+            }}
+        }}
         </style>
         <div class="star-shell">
             <div class="star-page" style="background-image: url('{hero_uri}');">
@@ -1868,7 +1992,9 @@ def render_star_page(data: dict) -> None:
                     <p>把分散的想法放在同一片天空里，方便大家查看和跟进。</p>
                     {empty_text}
                 </div>
-                <a class="star-page-back" href="?view=landing">← 返回</a>
+                <form class="sp-back-form" method="get" action="/">
+                    <button class="sp-back-button" type="submit">← 返回</button>
+                </form>
                 {''.join(star_links)}
                 {detail_html}
             </div>
@@ -1881,15 +2007,18 @@ def render_settings_panel() -> None:
     st.markdown("**AI 设置**")
     deepseek_key, deepseek_model = get_deepseek_config()
     gemini_key, gemini_model = get_gemini_config()
+    supabase_url, supabase_key = get_supabase_config()
     st.caption(f"DeepSeek：{'已配置' if deepseek_key else '未配置'}")
     st.caption(f"DeepSeek 默认模型：{deepseek_model}")
     st.caption(f"Gemini：{'已配置' if gemini_key else '未配置'}")
     st.caption(f"Gemini 默认模型：{gemini_model}")
+    st.markdown("**数据存储**")
+    st.caption(f"Supabase：{'已配置' if supabase_url and supabase_key else '未配置，当前使用本地 JSON'}")
 
 
 def sidebar(data: dict) -> None:
     with st.sidebar:
-        st.markdown("## 群星")
+        st.markdown("## Stellar")
         st.caption("反馈收集 · 进度公开")
         if st.button("返回入口页", use_container_width=True):
             st.session_state["view"] = "landing"
@@ -1898,6 +2027,23 @@ def sidebar(data: dict) -> None:
         st.divider()
         st.metric("想法总数", len(data["ideas"]))
         st.metric("事项总数", len(data["tasks"]))
+        st.divider()
+        st.download_button(
+            "下载数据备份",
+            data=json.dumps(data, ensure_ascii=False, indent=2),
+            file_name=f"stellar_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        uploaded_backup = st.file_uploader("恢复数据备份", type=["json"], label_visibility="collapsed")
+        if uploaded_backup is not None:
+            try:
+                restored = normalize_data(json.loads(uploaded_backup.getvalue().decode("utf-8")))
+                save_data(restored)
+                st.success("数据已恢复。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"恢复失败：{exc}")
         st.divider()
         render_settings_panel()
 
@@ -1926,14 +2072,18 @@ def main() -> None:
         render_landing(data)
         return
 
-    if st.session_state["view"] == "stars":
+    if st.session_state["view"] == "stars" or st.query_params.get("page") == "stars":
         render_star_page(data)
         return
 
     sidebar(data)
     page_param = st.query_params.get("page")
     default_page = {"progress": "查看进度"}.get(page_param, "提交反馈")
-    page = st.segmented_control("页面", ["提交反馈", "查看进度"], default=default_page)
+    page = st.segmented_control("页面", ["提交反馈", "查看进度", "星空意见图"], default=default_page)
+    if page == "星空意见图":
+        st.query_params["view"] = "workspace"
+        st.query_params["page"] = "stars"
+        st.rerun()
     render_hero(data)
     if page == "提交反馈":
         render_submit_feedback(data)
