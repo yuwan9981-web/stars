@@ -1,0 +1,26 @@
+{
+  "ideas": [
+    {
+      "id": "idea-2c6a7867",
+      "title": "加强部门间信息流通",
+      "category": "沟通协同",
+      "author": "AI 转译",
+      "anonymous": true,
+      "content": "目前部门间信息共享不足，导致协作效率低下，需优化沟通机制。",
+      "impact": "建立定期跨部门会议机制，明确信息共享流程与责任人。",
+      "status": "待确认",
+      "heat": 80,
+      "votes": 1,
+      "created_at": "2026-06-23 16:08"
+    }
+  ],
+  "tasks": [],
+  "events": [],
+  "briefs": [],
+  "council": {
+    "cycle": "",
+    "cadence": "",
+    "members": [],
+    "principles": []
+  }
+}
