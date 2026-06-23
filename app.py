@@ -1100,7 +1100,9 @@ def render_submit_form(data: dict) -> None:
             },
         )
         save_data(data)
-        st.success("已提交。后续会在“查看进度”里显示处理状态。")
+        st.success("已提交！正在跳转到进度页面……")
+        st.query_params["view"] = "workspace"
+        st.query_params["page"] = "progress"
         st.rerun()
 
 
@@ -1645,9 +1647,14 @@ def render_feedback_progress(data: dict) -> None:
         if selected != "全部" and idea["category"] != selected:
             continue
         render_idea_card(idea)
+        if st.button("删除", key=f"del_{idea['id']}", type="tertiary"):
+            data["ideas"] = [i for i in data["ideas"] if i["id"] != idea["id"]]
+            save_data(data)
+            st.rerun()
 
     with st.expander("事项处理进度", expanded=False):
         render_tasks(data)
+
 
 
 def star_position(index: int) -> tuple[int, int]:
