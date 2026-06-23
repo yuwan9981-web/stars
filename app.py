@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
+import math
 import os
 import re
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -41,6 +43,142 @@ DEFAULT_DATA = {
 }
 
 
+HEAT_WEIGHTS = {
+    "impact": 0.30,
+    "urgency": 0.25,
+    "resonance": 0.25,
+    "duplication": 0.10,
+    "actionability": 0.10,
+}
+
+
+def keyword_score(text: str, groups: list[tuple[set[str], int]], default: int) -> int:
+    for keywords, score in groups:
+        if any(keyword in text for keyword in keywords):
+            return score
+    return default
+
+
+def extract_topic_tokens(text: str) -> set[str]:
+    keywords = {
+        "沟通", "信息", "同步", "流程", "负责人", "活动", "团建", "补贴", "奖金", "加班",
+        "晋升", "培训", "反馈", "协作", "会议", "预算", "分工", "透明", "权益", "效率",
+    }
+    return {keyword for keyword in keywords if keyword in text}
+
+
+def calculate_heat_factors(idea: dict, all_ideas: list[dict] | None = None) -> dict:
+    title = str(idea.get("title", ""))
+    content = str(idea.get("content", ""))
+    impact_text = str(idea.get("impact", ""))
+    category = str(idea.get("category", ""))
+    text = f"{title} {content} {impact_text} {category}"
+    votes = max(0, int(idea.get("votes", 0) or 0))
+
+    impact = keyword_score(
+        text,
+        [
+            ({"全公司", "所有人", "大家", "整体", "公司"}, 92),
+            ({"跨部门", "部门间", "多部门", "部门"}, 78),
+            ({"小组", "团队", "项目"}, 62),
+            ({"个人", "我自己"}, 38),
+        ],
+        55,
+    )
+    urgency = keyword_score(
+        text,
+        [
+            ({"紧急", "马上", "立刻", "无法", "阻塞", "严重", "风险", "投诉", "安全"}, 90),
+            ({"经常", "反复", "一直", "长期", "影响工作", "效率低"}, 76),
+            ({"希望", "建议", "可以优化"}, 56),
+        ],
+        64 if category in {"沟通协同", "权益激励"} else 52,
+    )
+    resonance = round(min(100, math.log(votes + 1, 20) * 100))
+
+    tokens = extract_topic_tokens(text)
+    similar_count = 0
+    for other in all_ideas or []:
+        if other.get("id") == idea.get("id"):
+            continue
+        other_tokens = other.get("_tokens") or extract_topic_tokens(
+            f"{other.get('title', '')} {other.get('content', '')} {other.get('impact', '')} {other.get('category', '')}"
+        )
+        if category and category == other.get("category") and (tokens & other_tokens):
+            similar_count += 1
+    duplication = min(100, similar_count * 25)
+
+    actionability = 38
+    if len(content) >= 30:
+        actionability += 16
+    if len(impact_text) >= 12:
+        actionability += 20
+    if any(keyword in impact_text for keyword in {"建议", "希望", "明确", "建立", "流程", "负责人", "周期", "机制", "预算", "反馈"}):
+        actionability += 18
+    if any(keyword in text for keyword in {"谁", "什么时候", "如何", "怎么", "下一步"}):
+        actionability += 8
+    actionability = min(100, actionability)
+
+    return {
+        "impact": impact,
+        "urgency": urgency,
+        "resonance": resonance,
+        "duplication": duplication,
+        "actionability": actionability,
+    }
+
+
+def recalculate_idea_heat(idea: dict, all_ideas: list[dict] | None = None) -> int:
+    factors = calculate_heat_factors(idea, all_ideas)
+    idea["heat_factors"] = factors
+    heat = sum(factors[key] * weight for key, weight in HEAT_WEIGHTS.items())
+    return max(0, min(100, round(heat)))
+
+
+def normalize_idea(idea: dict) -> dict:
+    normalized = dict(idea)
+    normalized["id"] = str(normalized.get("id") or f"idea-{uuid4().hex[:8]}")
+    normalized["title"] = str(normalized.get("title") or "未命名反馈")
+    normalized["category"] = str(normalized.get("category") or "综合建议")
+    normalized["author"] = str(normalized.get("author") or "匿名")
+    normalized["anonymous"] = bool(normalized.get("anonymous", normalized["author"] == "匿名"))
+    normalized["content"] = str(normalized.get("content") or "")
+    normalized["impact"] = str(normalized.get("impact") or polish_text(normalized["content"]))
+    normalized["status"] = str(normalized.get("status") or "待确认")
+    normalized["base_heat"] = int(normalized.get("base_heat", normalized.get("heat", 64)) or 64)
+    normalized["votes"] = max(0, int(normalized.get("votes", 0) or 0))
+    normalized["voters"] = list(normalized.get("voters") or [])
+    normalized["heat"] = recalculate_idea_heat(normalized)
+    normalized["created_at"] = str(normalized.get("created_at") or now_str())
+    return normalized
+
+
+def normalize_task(task: dict) -> dict:
+    normalized = dict(task)
+    normalized["id"] = str(normalized.get("id") or f"task-{uuid4().hex[:8]}")
+    normalized["name"] = str(normalized.get("name") or "未命名事项")
+    normalized["owner"] = str(normalized.get("owner") or "待确认")
+    normalized["status"] = str(normalized.get("status") or "待确认")
+    normalized["priority"] = str(normalized.get("priority") or "中")
+    normalized["progress"] = max(0, min(100, int(normalized.get("progress") or 8)))
+    normalized["due"] = str(normalized.get("due") or "待定")
+    normalized["reward"] = str(normalized.get("reward") or "待定")
+    normalized["members"] = list(normalized.get("members") or ["员工协同小组"])
+    normalized["next_step"] = str(normalized.get("next_step") or "等待负责人确认")
+    return normalized
+
+
+def refresh_idea_heat_scores(ideas: list[dict]) -> list[dict]:
+    for idea in ideas:
+        text = f"{idea.get('title', '')} {idea.get('content', '')} {idea.get('impact', '')} {idea.get('category', '')}"
+        idea["_tokens"] = extract_topic_tokens(text)
+    for idea in ideas:
+        idea["heat"] = recalculate_idea_heat(idea, ideas)
+    for idea in ideas:
+        idea.pop("_tokens", None)
+    return ideas
+
+
 def load_data() -> dict:
     remote_data = load_remote_data()
     if remote_data is not None:
@@ -49,7 +187,7 @@ def load_data() -> dict:
         save_data(DEFAULT_DATA)
         return json.loads(json.dumps(DEFAULT_DATA))
     with DATA_FILE.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+        data = normalize_data(json.load(f))
     if "council" not in data:
         data["council"] = json.loads(json.dumps(DEFAULT_DATA["council"]))
         save_data(data)
@@ -83,6 +221,8 @@ def normalize_data(data: dict | None) -> dict:
     if isinstance(data, dict):
         for key, value in data.items():
             normalized[key] = value
+    normalized["ideas"] = refresh_idea_heat_scores([normalize_idea(idea) for idea in normalized.get("ideas", [])])
+    normalized["tasks"] = [normalize_task(task) for task in normalized.get("tasks", [])]
     if "council" not in normalized or not isinstance(normalized["council"], dict):
         normalized["council"] = json.loads(json.dumps(DEFAULT_DATA["council"]))
     return normalized
@@ -119,7 +259,7 @@ def save_remote_data(data: dict) -> bool:
         response = requests.post(
             f"{url}/rest/v1/{SUPABASE_TABLE}",
             headers={**supabase_headers(key), "Prefer": "resolution=merge-duplicates,return=minimal"},
-            json={"id": "main", "data": normalize_data(data), "updated_at": datetime.utcnow().isoformat()},
+            json={"id": "main", "data": normalize_data(data), "updated_at": datetime.now(timezone.utc).isoformat()},
             timeout=12,
         )
         response.raise_for_status()
@@ -169,7 +309,7 @@ def polish_text(text: str) -> str:
         return "建议补充更具体的背景和预期结果。"
     return (
         "建议将该问题作为可跟踪事项处理：先明确影响范围与负责人，"
-        f"再围绕“{compact[:42]}”形成执行动作，并在固定周期内反馈处理进展。"
+        f'再围绕“{compact[:42]}”形成执行动作，并在固定周期内反馈处理进展。'
     )
 
 
@@ -215,41 +355,14 @@ def call_gemini_translation_once(text: str, target: str, model: str, api_key: st
     from google import genai
     from google.genai import types
 
-    prompt = f"""
-把员工反馈转成公司内部可执行建议。只输出 JSON，不要 Markdown。
-字段：
-category 从 ["沟通协同","权益激励","流程规范","文化活动","成长发展","综合建议"] 选一项；
-priority 从 ["高","中","低"] 选一项；
-heat 为 0-100 整数；
-tone 为表达风格；
-title 28 字内；
-translated 120 字内，保留问题本质，弱化攻击性，不编造事实；
-next_step 60 字内。
-对象：{target}
-反馈：{text[:500]}
-""".strip()
-
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=25000))
     try:
-        response = client.models.generate_content(model=model, contents=prompt)
+        response = client.models.generate_content(model=model, contents=build_translation_prompt(text, target))
         output_text = getattr(response, "text", "") or str(response)
     finally:
         client.close()
 
-    parsed = extract_json_object(output_text)
-    category = parsed.get("category") or "综合建议"
-    priority = parsed.get("priority") or "中"
-    heat = int(parsed.get("heat") or 64)
-    return {
-        "category": category,
-        "priority": priority,
-        "heat": max(0, min(100, heat)),
-        "tone": parsed.get("tone") or "正式、克制、聚焦行动",
-        "title": parsed.get("title") or f"{category}优化建议",
-        "translated": parsed.get("translated") or polish_text(text),
-        "next_step": parsed.get("next_step") or "先由员工协同小组整理样本，再提交管理层确认负责人和反馈周期。",
-        "source": "Gemini API",
-    }
+    return normalize_ai_result(output_text, text, f"Gemini API · {model}")
 
 
 def call_gemini_translation(text: str, target: str, model: str, api_key: str) -> dict:
@@ -352,6 +465,7 @@ def translate_emotion(text: str, target: str) -> dict:
     tone_map = {
         "给管理层": "正式、克制、聚焦组织效率",
         "给员工协同小组": "真实、具体、便于整理和追踪",
+        "给协同负责人": "真实、具体、便于整理和追踪",
         "给活动负责人": "协作式、重视资源和分工",
     }
     action_map = {
@@ -363,7 +477,7 @@ def translate_emotion(text: str, target: str) -> dict:
     }
     core_action = action_map.get(category, "先收集更多样本，再形成可执行事项和反馈节奏。")
     translated = (
-        f"当前围绕“{topic_hint}”的反馈，反映出公司在{category}方面存在可优化空间。"
+        f'当前围绕"{topic_hint}"的反馈，反映出公司在{category}方面存在可优化空间。'
         f"建议将其作为{priority}优先级事项处理：{core_action}"
         "同时建议在处理过程中同步进展和结果，避免问题长期停留在口头沟通层面。"
     )
@@ -371,7 +485,7 @@ def translate_emotion(text: str, target: str) -> dict:
         "category": category,
         "priority": priority,
         "heat": heat,
-        "tone": tone_map[target],
+        "tone": tone_map.get(target, "正式、克制、聚焦行动"),
         "translated": translated,
         "title": f"{category}优化建议：{topic_hint}",
         "next_step": core_action,
@@ -579,6 +693,77 @@ def inject_css() -> None:
             background: linear-gradient(135deg, rgba(255, 94, 168, 0.25), rgba(247, 201, 72, 0.22));
             border: 1px solid rgba(255, 255, 255, 0.12);
             font-weight: 800;
+        }
+
+        .heat-breakdown {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 10px;
+        }
+
+        .heat-breakdown .tag {
+            margin-right: 0;
+            background: rgba(255, 255, 255, 0.055);
+            color: #cbd5e1;
+        }
+
+        .idea-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .idea-actions form {
+            margin: 0;
+        }
+
+        .idea-action-button {
+            appearance: none;
+            min-height: 36px;
+            padding: 0 14px;
+            border-radius: 999px;
+            border: 1px solid rgba(94, 234, 212, 0.34);
+            background: rgba(94, 234, 212, 0.10);
+            color: #eafffb;
+            font: inherit;
+            font-size: 13px;
+            font-weight: 800;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+        }
+
+        .idea-action-button:hover {
+            border-color: rgba(94, 234, 212, 0.72);
+            background: rgba(94, 234, 212, 0.18);
+        }
+
+        .idea-action-button.is-liked {
+            border-color: rgba(247, 201, 72, 0.52);
+            background: rgba(247, 201, 72, 0.16);
+            color: #fff4c2;
+        }
+
+        .idea-delete-button {
+            appearance: none;
+            min-height: 36px;
+            padding: 0 14px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 107, 107, 0.42);
+            background: rgba(255, 107, 107, 0.10);
+            color: #ffd5d5;
+            font: inherit;
+            font-size: 13px;
+            font-weight: 800;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+        }
+
+        .idea-delete-button:hover {
+            border-color: rgba(255, 107, 107, 0.74);
+            background: rgba(255, 107, 107, 0.18);
+            color: #fff;
         }
 
         .muted {
@@ -1088,6 +1273,14 @@ def render_landing(data: dict) -> None:
                             <input type="hidden" name="view" value="stars">
                             <button type="submit" class="landing-ghost">星空意见图</button>
                         </form>
+                        <form method="get">
+                            <input type="hidden" name="view" value="echoes">
+                            <button type="submit" class="landing-ghost">回声墙</button>
+                        </form>
+                        <form method="get">
+                            <input type="hidden" name="view" value="postcard">
+                            <button type="submit" class="landing-ghost">管理层明信片</button>
+                        </form>
                     </div>
                 </div>
             </section>
@@ -1114,7 +1307,7 @@ def render_hero(data: dict) -> None:
         <div class="metric-grid">
             <div class="metric-card"><div class="label">反馈数量</div><div class="value">{len(ideas)}</div><div class="hint">已提交的员工反馈</div></div>
             <div class="metric-card"><div class="label">处理中事项</div><div class="value">{open_tasks}</div><div class="hint">待确认、已受理或推进中</div></div>
-            <div class="metric-card"><div class="label">平均热度</div><div class="value">{avg_heat}%</div><div class="hint">根据投票与影响范围估算</div></div>
+            <div class="metric-card"><div class="label">平均热度</div><div class="value">{avg_heat}%</div><div class="hint">影响、紧急、共鸣、重复、可执行</div></div>
             <div class="metric-card"><div class="label">反馈类型</div><div class="value">{categories}</div><div class="hint">自动分类统计</div></div>
         </div>
         """,
@@ -1124,27 +1317,80 @@ def render_hero(data: dict) -> None:
         st.toast(f"已有 {completed} 个事项完成闭环")
 
 
-def render_idea_card(idea: dict) -> None:
+def query_form_fields(**params: str) -> str:
+    return "\n".join(
+        f'<input type="hidden" name="{html.escape(str(key))}" value="{html.escape(str(value), quote=True)}">'
+        for key, value in params.items()
+    )
+
+
+def liked_idea_ids() -> set[str]:
+    if "liked_idea_ids" not in st.session_state:
+        st.session_state["liked_idea_ids"] = set()
+    return st.session_state["liked_idea_ids"]
+
+
+def get_session_token() -> str:
+    if "session_token" not in st.session_state:
+        st.session_state["session_token"] = uuid4().hex
+    return st.session_state["session_token"]
+
+
+def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool = False) -> None:
     color = status_color(idea["status"])
-    st.markdown(
+    idea_id = str(idea["id"])
+    factors = idea.get("heat_factors") or calculate_heat_factors(idea)
+    factor_html = "".join(
+        f'<span class="tag">{label} {int(factors.get(key, 0))}</span>'
+        for key, label in [
+            ("impact", "影响"),
+            ("urgency", "紧急"),
+            ("resonance", "共鸣"),
+            ("duplication", "重复"),
+            ("actionability", "可执行"),
+        ]
+    )
+    is_liked = idea_id in liked_idea_ids()
+    like_class = "idea-action-button is-liked" if is_liked else "idea-action-button"
+    like_text = "已赞同" if is_liked else "赞同这个反馈"
+    action_html = ""
+    if show_actions:
+        action_html = f"""
+            <div class="idea-actions">
+                <form method="get">
+                    {query_form_fields(view="workspace", page="progress", op="like", idea=idea_id)}
+                    <button class="{like_class}" type="submit">{like_text}</button>
+                </form>
+        """
+        if allow_delete and idea.get("delete_code"):
+            action_html += f"""
+                <form method="get">
+                    {query_form_fields(view="workspace", page="progress", op="delete", idea=idea_id)}
+                    <button class="idea-delete-button" type="submit">删除反馈</button>
+                </form>
+            """
+        action_html += "</div>"
+
+    st.html(
         f"""
         <div class="idea-card">
             <div class="idea-head">
                 <div>
-                    <div class="idea-title">{idea["title"]}</div>
-                    <span class="tag">{idea["category"]}</span>
+                    <div class="idea-title">{html.escape(idea["title"])}</div>
+                    <span class="tag">{html.escape(idea["category"])}</span>
                     <span class="tag" style="border-color:{color}; color:{color};">{idea["status"]}</span>
-                    <span class="tag">来自：{idea["author"]}</span>
+                    <span class="tag">来自：{html.escape(idea["author"])}</span>
                 </div>
                 <div class="heat">{idea["heat"]}%<br><span style="font-size:11px;color:#dbeafe;">热度</span></div>
             </div>
-            <p>{idea["content"]}</p>
-            <p class="muted">预期影响：{idea["impact"]}</p>
+            <p>{html.escape(idea["content"])}</p>
+            <p class="muted">预期影响：{html.escape(idea["impact"])}</p>
             <span class="tag">赞同 {idea["votes"]}</span>
-            <span class="tag">{idea["created_at"]}</span>
+            <span class="tag">{html.escape(idea["created_at"])}</span>
+            <div class="heat-breakdown">{factor_html}</div>
+            {action_html}
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -1159,11 +1405,15 @@ def render_submit_form(data: dict) -> None:
         with col2:
             author = st.text_input("署名", placeholder="可填写昵称")
             anonymous = st.toggle("匿名提交", value=True)
+            delete_code = st.text_input("删除码（4位数字，记住它才能删除自己的反馈）*", max_chars=4, placeholder="如：1234")
             submitted = st.form_submit_button("提交反馈")
 
     if submitted:
         if not title.strip() or not content.strip():
             st.warning("标题和问题描述需要先写一下。")
+            return
+        if not delete_code.strip() or not delete_code.strip().isdigit() or len(delete_code.strip()) != 4:
+            st.warning("删除码必须是4位数字（提交后无法修改，请记住它）。")
             return
         category, _priority, heat = classify_text(f"{title} {content} {impact}")
         data["ideas"].insert(
@@ -1177,9 +1427,11 @@ def render_submit_form(data: dict) -> None:
                 "content": content.strip(),
                 "impact": impact.strip() or polish_text(content),
                 "status": "待确认",
+                "base_heat": heat,
                 "heat": heat,
                 "votes": 1,
                 "created_at": now_str(),
+                "delete_code": delete_code.strip() or "",
             },
         )
         save_data(data)
@@ -1255,6 +1507,29 @@ def render_translator(data: dict) -> None:
 
     result = st.session_state.get("translator_result")
     if result:
+        preview_idea = normalize_idea(
+            {
+                "title": result["title"],
+                "category": result["category"],
+                "author": "AI 转译",
+                "content": result["translated"],
+                "impact": result["next_step"],
+                "status": "待确认",
+                "votes": 1,
+                "created_at": now_str(),
+            }
+        )
+        preview_factors = preview_idea.get("heat_factors", {})
+        factor_preview = " · ".join(
+            f"{label}{int(preview_factors.get(key, 0))}"
+            for key, label in [
+                ("impact", "影响"),
+                ("urgency", "紧急"),
+                ("resonance", "共鸣"),
+                ("duplication", "重复"),
+                ("actionability", "可执行"),
+            ]
+        )
         left, right = st.columns([1.05, 0.95])
         with left:
             st.markdown(
@@ -1263,10 +1538,11 @@ def render_translator(data: dict) -> None:
                     <span class="tag">来源：{result.get("source", "本地规则")}</span>
                     <span class="tag">{result["category"]}</span>
                     <span class="tag">优先级：{result["priority"]}</span>
-                    <span class="tag">热度：{result["heat"]}%</span>
+                    <span class="tag">预计热度：{preview_idea["heat"]}%</span>
                     <div class="idea-title">{result["title"]}</div>
                     <p>{result["translated"]}</p>
                     <p class="muted">建议下一步：{result["next_step"]}</p>
+                    <p class="muted">热度构成：{factor_preview}</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1283,9 +1559,8 @@ def render_translator(data: dict) -> None:
                 unsafe_allow_html=True,
             )
 
-        if st.button("把转译结果送入想法广场", use_container_width=True):
-            data["ideas"].insert(
-                0,
+        if st.button("把转译结果送入查看进度", key="send_translator_result", use_container_width=True):
+            translated_idea = normalize_idea(
                 {
                     "id": f"idea-{uuid4().hex[:8]}",
                     "title": result["title"],
@@ -1295,45 +1570,53 @@ def render_translator(data: dict) -> None:
                     "content": result["translated"],
                     "impact": result["next_step"],
                     "status": "待确认",
-                    "heat": result["heat"],
+                    "base_heat": preview_idea["heat"],
+                    "heat": preview_idea["heat"],
                     "votes": 1,
                     "created_at": now_str(),
-                },
+                }
             )
+            data["ideas"].insert(0, translated_idea)
             save_data(data)
-            st.success("已送入想法广场，协同小组可以继续合并、筛选和推进。")
+            st.session_state.pop("translator_result", None)
+            st.session_state.pop("translator_raw", None)
+            st.session_state.pop("translator_target", None)
+            st.session_state["pending_toast"] = "已送入查看进度列表。"
+            st.query_params["view"] = "workspace"
+            st.query_params["page"] = "progress"
             st.rerun()
 
 
 def render_task_card(task: dict) -> None:
     color = status_color(task["status"])
-    members = " / ".join(task["members"])
-    st.markdown(
+    members = html.escape(" / ".join(task["members"]))
+    plan_html = f'<p class="muted">实施方案：{html.escape(task["plan"])}</p>' if task.get("plan") else ""
+    st.html(
         f"""
         <div class="task-card">
             <div class="idea-head">
                 <div>
-                    <div class="idea-title">{task["name"]}</div>
-                    <span class="tag" style="border-color:{color}; color:{color};">{task["status"]}</span>
-                    <span class="tag">优先级：{task["priority"]}</span>
-                    <span class="tag">截止：{task["due"]}</span>
+                    <div class="idea-title">{html.escape(task["name"])}</div>
+                    <span class="tag" style="border-color:{color}; color:{color};">{html.escape(task["status"])}</span>
+                    <span class="tag">优先级：{html.escape(task["priority"])}</span>
+                    <span class="tag">截止：{html.escape(str(task["due"]))}</span>
                 </div>
                 <div class="heat">{task["progress"]}%<br><span style="font-size:11px;color:#dbeafe;">进度</span></div>
             </div>
             <div class="progress-shell"><div class="progress-bar" style="width:{task["progress"]}%;"></div></div>
-            <p>负责人：{task["owner"]}</p>
+            <p>负责人：{html.escape(task["owner"])}</p>
             <p class="muted">参与方：{members}</p>
-            <p class="muted">下一步：{task["next_step"]}</p>
-            <span class="tag">激励：{task["reward"]}</span>
+            <p class="muted">下一步：{html.escape(task["next_step"])}</p>
+            {plan_html}
+            <span class="tag">激励：{html.escape(task["reward"])}</span>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
 def render_tasks(data: dict) -> None:
     st.markdown('<div class="section-title">事项看板</div>', unsafe_allow_html=True)
-    st.caption("把“有人提了但没人接”的事情变成有状态、有负责人、有下一步的协作任务。")
+    st.caption('把“有人提了但没人接”的事情变成有状态、有负责人、有下一步的协作任务。')
 
     statuses = ["待确认", "已受理", "推进中", "已完成", "暂缓"]
     cols = st.columns(len(statuses))
@@ -1373,12 +1656,41 @@ def render_tasks(data: dict) -> None:
 
     for task in data["tasks"]:
         render_task_card(task)
+        plan = task.get("plan", "")
+        with st.expander("实施方案" + ("  ✓" if plan else ""), expanded=False):
+            new_plan = st.text_area(
+                "具体实施方案",
+                value=plan,
+                placeholder="描述如何推进：分几步、谁负责哪块、预计时间节点……",
+                key=f"plan_{task['id']}",
+                height=120,
+            )
+            status_options = ["待确认", "已受理", "推进中", "已完成", "暂缓"]
+            current_idx = status_options.index(task["status"]) if task["status"] in status_options else 0
+            new_status = st.selectbox("更新状态", status_options, index=current_idx, key=f"status_{task['id']}")
+            if st.button("保存", key=f"save_{task['id']}"):
+                if new_status == "已完成" and not new_plan.strip():
+                    st.error("标记为「已完成」前请先填写实施方案。")
+                else:
+                    task["plan"] = new_plan.strip()
+                    task["status"] = new_status
+                    if new_status == "已完成":
+                        task["progress"] = 100
+                    elif new_status == "推进中" and task["progress"] < 10:
+                        task["progress"] = 30
+                    save_data(data)
+                    st.toast("已保存。")
+                    st.rerun()
 
 
 def render_event(data: dict) -> None:
+    if not data.get("events"):
+        st.info("暂无活动。")
+        return
     event = data["events"][0]
-    done = sum(1 for slot in event["slots"] if slot["done"])
-    total = len(event["slots"])
+    slots = event.get("slots") or []
+    done = sum(1 for slot in slots if slot.get("done"))
+    total = len(slots) or 1
     progress = round(done / total * 100)
     st.markdown('<div class="section-title">活动共创实验室</div>', unsafe_allow_html=True)
     st.markdown(
@@ -1461,7 +1773,7 @@ def build_brief(data: dict) -> str:
 
 ## AI 建议
 1. 优先处理热度高且影响范围广的沟通协同问题，避免信息差继续扩大。
-2. 对公共事务组织建立补贴、调休或贡献记录，防止“临时有空的人”持续承担隐性成本。
+2. 对公共事务组织建立补贴、调休或贡献记录，防止"临时有空的人"持续承担隐性成本。
 3. 以烧烤活动作为第一个共创样板，跑通投票、认领、预算、执行、复盘的完整闭环。
 """
 
@@ -1568,7 +1880,7 @@ def render_management_dashboard(data: dict) -> None:
 
 def render_council(data: dict) -> None:
     st.markdown('<div class="section-title">员工协同小组</div>', unsafe_allow_html=True)
-    st.caption("把“地下自发”转成公开、透明、有边界的员工事务协同机制。")
+    st.caption('把“地下自发”转成公开、透明、有边界的员工事务协同机制。')
 
     council = data.get("council", DEFAULT_DATA["council"])
     st.markdown(
@@ -1721,19 +2033,38 @@ def render_submit_feedback(data: dict) -> None:
 def render_feedback_progress(data: dict) -> None:
     st.markdown('<div class="section-title">查看进度</div>', unsafe_allow_html=True)
     st.caption("这里展示已经提交的反馈和正在推进的事项。")
+
+    pending_id = st.session_state.get("pending_delete_id", "")
+    if pending_id:
+        pending_idea = next((i for i in data["ideas"] if i["id"] == pending_id), None)
+        if pending_idea:
+            st.warning(f"请输入「{pending_idea['title']}」的删除码以确认删除")
+            col1, col2, col3 = st.columns([1, 0.4, 0.4])
+            entered = col1.text_input("删除码", max_chars=4, label_visibility="collapsed", placeholder="输入提交时设置的4位删除码")
+            if col2.button("确认删除", type="primary"):
+                if entered.strip() == pending_idea.get("delete_code", ""):
+                    data["ideas"] = [i for i in data["ideas"] if i["id"] != pending_id]
+                    liked_idea_ids().discard(pending_id)
+                    save_data(data)
+                    st.session_state.pop("pending_delete_id", None)
+                    st.toast("已删除这条反馈。")
+                    st.rerun()
+                else:
+                    st.error("删除码不正确。")
+            if col3.button("取消"):
+                st.session_state.pop("pending_delete_id", None)
+                st.rerun()
+            st.divider()
+
     if not data["ideas"]:
-        st.info("还没有反馈。可以先到“提交反馈”写下第一条。")
+        st.info('还没有反馈。可以先到“提交反馈”写下第一条。')
         return
     categories = ["全部"] + sorted({i["category"] for i in data["ideas"]})
     selected = st.segmented_control("反馈类型", categories, default="全部")
     for idea in data["ideas"]:
         if selected != "全部" and idea["category"] != selected:
             continue
-        render_idea_card(idea)
-        if st.button("删除", key=f"del_{idea['id']}", type="tertiary"):
-            data["ideas"] = [i for i in data["ideas"] if i["id"] != idea["id"]]
-            save_data(data)
-            st.rerun()
+        render_idea_card(idea, show_actions=True, allow_delete=True)
 
     with st.expander("事项处理进度", expanded=False):
         render_tasks(data)
@@ -1747,6 +2078,79 @@ def star_position(index: int) -> tuple[int, int]:
         (49, 45), (62, 56), (34, 37), (79, 60), (91, 22),
     ]
     return positions[index % len(positions)]
+
+
+CONSTELLATION_NAMES = {
+    "沟通协同": "信息流星座",
+    "权益激励": "温度星座",
+    "流程规范": "秩序星座",
+    "文化活动": "共创星座",
+    "成长发展": "成长星座",
+    "综合建议": "微光星座",
+}
+
+
+CONSTELLATION_COLORS = {
+    "沟通协同": "#5eead4",
+    "权益激励": "#f7c948",
+    "流程规范": "#7c8cff",
+    "文化活动": "#ff5ea8",
+    "成长发展": "#60d394",
+    "综合建议": "#cbd5e1",
+}
+
+
+def build_constellations(ideas: list[dict]) -> list[dict]:
+    groups: dict[str, list[tuple[int, dict]]] = {}
+    for index, idea in enumerate(ideas):
+        category = str(idea.get("category") or "综合建议")
+        groups.setdefault(category, []).append((index, idea))
+
+    constellations = []
+    for category, items in groups.items():
+        if len(items) < 2:
+            continue
+        points = []
+        for index, idea in items:
+            x, y = star_position(index)
+            text = f"{idea.get('title', '')} {idea.get('content', '')} {idea.get('impact', '')} {category}"
+            points.append(
+                {
+                    "index": index,
+                    "x": x,
+                    "y": y,
+                    "tokens": extract_topic_tokens(text),
+                    "heat": int(idea.get("heat", 0) or 0),
+                }
+            )
+
+        connected_pairs = []
+        for current, following in zip(points, points[1:]):
+            connected_pairs.append((current, following))
+        for left_index, left in enumerate(points):
+            for right in points[left_index + 1 :]:
+                if left["tokens"] & right["tokens"]:
+                    pair = (left, right)
+                    reverse_pair = (right, left)
+                    if pair not in connected_pairs and reverse_pair not in connected_pairs:
+                        connected_pairs.append(pair)
+
+        center_x = round(sum(point["x"] for point in points) / len(points), 1)
+        center_y = round(sum(point["y"] for point in points) / len(points), 1)
+        avg_heat = round(sum(point["heat"] for point in points) / len(points))
+        constellations.append(
+            {
+                "category": category,
+                "name": CONSTELLATION_NAMES.get(category, f"{category}星座"),
+                "color": CONSTELLATION_COLORS.get(category, "#cbd5e1"),
+                "count": len(points),
+                "avg_heat": avg_heat,
+                "x": center_x,
+                "y": max(12, center_y - 8),
+                "pairs": connected_pairs,
+            }
+        )
+    return constellations
 
 
 def render_star_map(data: dict) -> None:
@@ -1803,45 +2207,159 @@ def render_star_page(data: dict) -> None:
     hide_sidebar_for_landing()
     ideas = data["ideas"]
     hero_uri = image_data_uri(NIGHT_HERO_IMAGE)
-    selected_id = st.query_params.get("idea", "")
 
-    star_links = []
+    star_items = []
+    detail_cards = []
     for index, idea in enumerate(ideas):
         x, y = star_position(index)
-        title = idea["title"].replace('"', "&quot;")
-        star_links.append(
-            f'<a class="sp-star" style="left:{x}%; top:{y}%;" '
-            f'href="?view=workspace&page=stars&idea={idea["id"]}" title="{title}">{title}</a>'
+        detail_id = f"star-detail-{index}"
+        title = html.escape(idea["title"])
+        category = html.escape(idea["category"])
+        status = html.escape(idea["status"])
+        content = html.escape(idea["content"])
+        impact = html.escape(idea["impact"])
+        created_at = html.escape(idea["created_at"])
+        color = status_color(idea["status"])
+        star_items.append(
+            f'<a class="sp-star" href="#{detail_id}" style="left:{x}%; top:{y}%;" title="{title}">{title}</a>'
+        )
+        detail_cards.append(
+            f"""
+            <div class="star-page-detail" id="{detail_id}">
+                <span class="sp-tag">{category}</span>
+                <span class="sp-tag" style="border-color:{color}; color:{color};">{status}</span>
+                <span class="sp-tag">热度 {idea["heat"]}%</span>
+                <a class="sp-close" href="#star-field">关闭</a>
+                <div class="sp-idea-title">{title}</div>
+                <p style="margin:6px 0 4px; color:#d5deed;">{content}</p>
+                <p style="margin:0; color:#9aa7bd; font-size:13px;">希望改进：{impact} · {created_at}</p>
+            </div>
+            """
         )
 
-    selected = next((idea for idea in ideas if idea["id"] == selected_id), None)
-    detail_html = ""
-    if selected:
-        color = status_color(selected["status"])
-        detail_html = f"""
-        <div class="star-page-detail">
-            <span class="sp-tag">{selected["category"]}</span>
-            <span class="sp-tag" style="border-color:{color}; color:{color};">{selected["status"]}</span>
-            <span class="sp-tag">热度 {selected["heat"]}%</span>
-            <div class="sp-idea-title">{selected["title"]}</div>
-            <p style="margin:6px 0 4px; color:#d5deed;">{selected["content"]}</p>
-            <p style="margin:0; color:#9aa7bd; font-size:13px;">希望改进：{selected["impact"]} · {selected["created_at"]}</p>
+    constellations = build_constellations(ideas)
+    constellation_categories = {constellation["category"] for constellation in constellations}
+    constellation_lines = []
+    constellation_labels = []
+    constellation_seed_labels = []
+    constellation_panel_items = []
+    for constellation in constellations:
+        color = constellation["color"]
+        for left, right in constellation["pairs"]:
+            constellation_lines.append(
+                f'<line x1="{left["x"]}%" y1="{left["y"]}%" x2="{right["x"]}%" y2="{right["y"]}%" '
+                f'stroke="{color}" stroke-width="1.4" stroke-linecap="round" />'
+            )
+        constellation_labels.append(
+            f"""
+            <div class="sp-constellation-label" style="left:{constellation["x"]}%; top:{constellation["y"]}%; border-color:{color}; color:{color};">
+                {html.escape(constellation["name"])}
+            </div>
+            """
+        )
+        constellation_panel_items.append(
+            f"""
+            <div class="sp-constellation-item">
+                <span class="sp-constellation-dot" style="background:{color}; box-shadow:0 0 14px {color};"></span>
+                <div>
+                    <strong>{html.escape(constellation["name"])}</strong>
+                    <span>{constellation["count"]} 颗星 · 平均热度 {constellation["avg_heat"]}%</span>
+                </div>
+            </div>
+            """
+        )
+
+    for index, idea in enumerate(ideas):
+        category = str(idea.get("category") or "综合建议")
+        if category in constellation_categories:
+            continue
+        x, y = star_position(index)
+        seed_name = CONSTELLATION_NAMES.get(category, f"{category}星座")
+        seed_color = CONSTELLATION_COLORS.get(category, "#cbd5e1")
+        constellation_seed_labels.append(
+            f"""
+            <div class="sp-constellation-seed" style="left:{x}%; top:{max(10, y + 6)}%; border-color:{seed_color}; color:{seed_color};">
+                {html.escape(seed_name)} · 待连接
+            </div>
+            """
+        )
+
+    constellation_svg = ""
+    if constellation_lines:
+        constellation_svg = f"""
+        <svg class="sp-constellation-lines" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+                <filter id="constellation-glow">
+                    <feGaussianBlur stdDeviation="0.55" result="blur" />
+                    <feMerge>
+                        <feMergeNode in="blur" />
+                        <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                </filter>
+            </defs>
+            <g filter="url(#constellation-glow)">
+                {''.join(constellation_lines)}
+            </g>
+        </svg>
+        """
+
+    constellation_panel = ""
+    if constellations:
+        constellation_panel = f"""
+        <div class="sp-constellation-panel">
+            <div class="sp-panel-title">意见星座</div>
+            {''.join(constellation_panel_items)}
+        </div>
+        """
+    elif ideas:
+        constellation_panel = """
+        <div class="sp-constellation-panel">
+            <div class="sp-panel-title">意见星座</div>
+            <p>第一颗星已经出现，等待更多同频意见连成星座。</p>
         </div>
         """
 
     empty_text = "" if ideas else "<p style='color:#9aa7bd;margin:12px 0 0;'>还没有反馈，提交第一条后这里会出现第一颗星。</p>"
 
-    st.html(
-        f"""
+    star_page_html = f"""
         <style>
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"], .main {{
+            width: 100vw !important;
+            height: 100dvh !important;
+            min-height: 100dvh !important;
+            overflow: hidden !important;
+            background: #040914 !important;
+        }}
+        .block-container {{
+            width: 100vw !important;
+            height: 100dvh !important;
+            min-height: 100dvh !important;
+            max-width: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            overflow: hidden !important;
+            background: #040914 !important;
+        }}
+        [data-testid="stVerticalBlock"],
+        [data-testid="stElementContainer"],
+        [data-testid="stHtml"],
+        [data-testid="stMarkdownContainer"] {{
+            width: 100vw !important;
+            max-width: none !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
         .star-shell {{
             position: fixed;
             inset: 0;
             width: 100vw;
             height: 100dvh;
+            min-height: 100dvh;
             overflow: hidden;
+            background: #040914;
+            z-index: 999;
         }}
-        [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] {{
+        [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"], footer, header {{
             display: none !important;
         }}
         .star-page {{
@@ -1851,7 +2369,8 @@ def render_star_page(data: dict) -> None:
             min-height: 100dvh;
             overflow: hidden;
             background-size: cover;
-            background-position: center bottom;
+            background-position: center center;
+            background-repeat: no-repeat;
             color: #f7fbff;
             font-family: inherit;
         }}
@@ -1867,7 +2386,7 @@ def render_star_page(data: dict) -> None:
         .star-page-title {{
             position: absolute;
             left: 40px;
-            top: 36px;
+            top: 74px;
             z-index: 2;
             max-width: 460px;
         }}
@@ -1884,12 +2403,21 @@ def render_star_page(data: dict) -> None:
         }}
         .sp-back-form {{
             position: absolute;
-            bottom: 28px;
+            top: 28px;
             left: 36px;
-            z-index: 10;
+            z-index: 30;
             margin: 0;
             width: auto;
             height: auto;
+        }}
+        .sp-view-tools {{
+            position: absolute;
+            top: 28px;
+            right: 36px;
+            z-index: 30;
+            display: flex;
+            gap: 10px;
+            align-items: center;
         }}
         .sp-back-button {{
             appearance: none;
@@ -1913,7 +2441,37 @@ def render_star_page(data: dict) -> None:
             white-space: nowrap;
             cursor: pointer;
         }}
+        .sp-layer-toggle {{
+            display: inline-flex;
+            align-items: center;
+            min-height: 33px;
+            padding: 0 14px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.22);
+            background: rgba(8,13,26,0.34);
+            backdrop-filter: blur(10px);
+            color: #f0f6ff;
+            font-size: 13px;
+            font-weight: 700;
+            text-decoration: none;
+            line-height: 1;
+            white-space: nowrap;
+        }}
+        .sp-hide-notes {{
+            display: none;
+        }}
+        #constellation-notes:target ~ .sp-view-tools .sp-show-notes {{
+            display: none;
+        }}
+        #constellation-notes:target ~ .sp-view-tools .sp-hide-notes {{
+            display: inline-flex;
+        }}
         .sp-back-button:hover {{
+            background: rgba(94,234,212,0.18);
+            border-color: rgba(94,234,212,0.5);
+            color: #5eead4;
+        }}
+        .sp-layer-toggle:hover {{
             background: rgba(94,234,212,0.18);
             border-color: rgba(94,234,212,0.5);
             color: #5eead4;
@@ -1937,17 +2495,125 @@ def render_star_page(data: dict) -> None:
             height: 20px;
             background: #5eead4;
         }}
+        .sp-constellation-lines {{
+            position: absolute;
+            inset: 0;
+            z-index: 2;
+            width: 100%;
+            height: 100%;
+            opacity: 0.62;
+            pointer-events: none;
+        }}
+        .sp-constellation-label {{
+            position: absolute;
+            z-index: 4;
+            transform: translate(-50%, -50%);
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.22);
+            background: rgba(5,8,18,0.42);
+            backdrop-filter: blur(10px);
+            font-size: 12px;
+            font-weight: 850;
+            white-space: nowrap;
+            pointer-events: none;
+            text-shadow: 0 0 12px rgba(0,0,0,0.6);
+        }}
+        .sp-constellation-seed {{
+            position: absolute;
+            z-index: 4;
+            transform: translate(-50%, -50%);
+            padding: 3px 9px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.18);
+            background: rgba(5,8,18,0.32);
+            backdrop-filter: blur(8px);
+            font-size: 11px;
+            font-weight: 750;
+            white-space: nowrap;
+            pointer-events: none;
+            opacity: 0.82;
+        }}
+        .sp-constellation-panel {{
+            position: absolute;
+            left: 40px;
+            bottom: 32px;
+            z-index: 8;
+            width: min(320px, calc(100vw - 80px));
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 16px;
+            background: rgba(8,13,26,0.52);
+            backdrop-filter: blur(16px);
+            padding: 14px 16px;
+            color: #d5deed;
+        }}
+        .sp-notes-layer {{
+            display: none;
+        }}
+        #constellation-notes:target ~ .sp-notes-layer {{
+            display: block;
+        }}
+        .sp-anchor {{
+            position: absolute;
+            inset: 0 auto auto 0;
+            width: 1px;
+            height: 1px;
+            pointer-events: none;
+            opacity: 0;
+        }}
+        .sp-panel-title {{
+            color: #f7fbff;
+            font-weight: 900;
+            margin-bottom: 10px;
+        }}
+        .sp-constellation-panel p {{
+            margin: 0;
+            color: #9aa7bd;
+            font-size: 13px;
+            line-height: 1.55;
+        }}
+        .sp-constellation-item {{
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-top: 9px;
+        }}
+        .sp-constellation-item strong {{
+            display: block;
+            color: #f7fbff;
+            font-size: 13px;
+            line-height: 1.2;
+        }}
+        .sp-constellation-item span:last-child {{
+            display: block;
+            color: #9aa7bd;
+            font-size: 12px;
+            margin-top: 2px;
+        }}
+        .sp-constellation-dot {{
+            width: 9px;
+            height: 9px;
+            border-radius: 999px;
+            flex: 0 0 auto;
+        }}
         .star-page-detail {{
             position: absolute;
             bottom: 32px;
             left: 40px;
             right: 40px;
-            z-index: 10;
+            z-index: 20;
             border: 1px solid rgba(255,255,255,0.16);
             border-radius: 16px;
             background: rgba(8,13,26,0.78);
             backdrop-filter: blur(18px);
             padding: 20px 24px;
+            display: none;
+        }}
+        .star-page-detail:target {{
+            display: block;
+        }}
+        .star-page-detail:target ~ .sp-constellation-panel {{
+            display: none;
         }}
         .sp-tag {{
             display: inline-block;
@@ -1965,10 +2631,29 @@ def render_star_page(data: dict) -> None:
             color: #f7fbff;
             margin: 4px 0 8px;
         }}
+        .sp-close {{
+            float: right;
+            display: inline-flex;
+            align-items: center;
+            min-height: 28px;
+            padding: 0 11px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.18);
+            color: #cbd5e1;
+            font-size: 12px;
+            font-weight: 750;
+            cursor: pointer;
+            background: rgba(255,255,255,0.06);
+            text-decoration: none;
+        }}
+        .sp-close:hover {{
+            color: #5eead4;
+            border-color: rgba(94,234,212,0.42);
+        }}
         @media (max-width: 700px) {{
             .star-page-title {{
                 left: 22px;
-                top: 26px;
+                top: 70px;
                 right: 22px;
             }}
             .star-page-title h2 {{
@@ -1976,17 +2661,35 @@ def render_star_page(data: dict) -> None:
             }}
             .sp-back-form {{
                 left: 22px;
-                bottom: 22px;
+                top: 22px;
+            }}
+            .sp-view-tools {{
+                right: 22px;
+                top: 22px;
+            }}
+            .sp-layer-toggle {{
+                font-size: 12px;
+                padding: 0 11px;
             }}
             .star-page-detail {{
                 left: 22px;
                 right: 22px;
-                bottom: 76px;
+                bottom: 22px;
+            }}
+            .sp-constellation-panel {{
+                left: 22px;
+                right: 22px;
+                bottom: 22px;
+                width: auto;
+            }}
+            .sp-constellation-label {{
+                font-size: 11px;
             }}
         }}
         </style>
         <div class="star-shell">
-            <div class="star-page" style="background-image: url('{hero_uri}');">
+            <div class="star-page" id="star-field" style="background-image: url('{hero_uri}');">
+                <span class="sp-anchor" id="constellation-notes"></span>
                 <div class="star-page-title">
                     <h2>意见像星星一样被看见</h2>
                     <p>把分散的想法放在同一片天空里，方便大家查看和跟进。</p>
@@ -1995,12 +2698,693 @@ def render_star_page(data: dict) -> None:
                 <form class="sp-back-form" method="get" action="/">
                     <button class="sp-back-button" type="submit">← 返回</button>
                 </form>
-                {''.join(star_links)}
-                {detail_html}
+                <div class="sp-view-tools">
+                    <a class="sp-layer-toggle sp-show-notes" href="#constellation-notes">显示星座说明</a>
+                    <a class="sp-layer-toggle sp-hide-notes" href="#star-field">隐藏星座说明</a>
+                </div>
+                {constellation_svg}
+                <div class="sp-notes-layer">
+                    {''.join(constellation_labels)}
+                    {''.join(constellation_seed_labels)}
+                    {constellation_panel}
+                </div>
+                {''.join(star_items)}
+                {''.join(detail_cards)}
             </div>
         </div>
         """
-    )
+    st.markdown("\n".join(line.strip() for line in star_page_html.splitlines()), unsafe_allow_html=True)
+
+
+def make_echo_text(idea: dict) -> str:
+    category = str(idea.get("category") or "综合建议")
+    title = str(idea.get("title") or "这条反馈")
+    templates = {
+        "沟通协同": "这不是一句抱怨，而是在提醒我们：信息需要更早抵达每一个正在努力的人。",
+        "权益激励": "这份声音在说：被照顾到的感受，也会成为继续投入的力量。",
+        "流程规范": "这条反馈想让事情少一些临时补救，多一些清楚可循的路径。",
+        "文化活动": "这里藏着一个愿望：让活动不只是被安排，而是被大家一起点亮。",
+        "成长发展": "这份期待指向更长远的东西：让努力被看见，也让成长有方向。",
+        "综合建议": "这是一颗小小的信号，提醒我们把模糊的不舒服变成可以讨论的改进。",
+    }
+    return templates.get(category, f'关于"{title[:18]}"的声音，正在等待一次认真回应。')
+
+
+def render_echo_wall(data: dict) -> None:
+    hide_sidebar_for_landing()
+    ideas = data["ideas"]
+    hero_uri = image_data_uri(NIGHT_HERO_IMAGE)
+    positions = [
+        (38, 46), (68, 38), (82, 56), (24, 64), (54, 62),
+        (76, 72), (32, 78), (50, 76), (66, 82), (84, 68),
+    ]
+    echo_cards = []
+    for index, idea in enumerate(ideas[:10]):
+        x, y = positions[index % len(positions)]
+        delay = round((index % 5) * 0.7, 1)
+        category = html.escape(str(idea.get("category") or "综合建议"))
+        title = html.escape(str(idea.get("title") or "未命名反馈"))
+        echo = html.escape(make_echo_text(idea))
+        heat = int(idea.get("heat", 0) or 0)
+        echo_cards.append(
+            f"""
+            <div class="echo-card" style="left:{x}%; top:{y}%; animation-delay:{delay}s;">
+                <span>{category} · 热度 {heat}%</span>
+                <strong>{title}</strong>
+                <p>{echo}</p>
+            </div>
+            """
+        )
+
+    empty_text = ""
+    if not ideas:
+        empty_text = """
+        <div class="echo-empty">
+            还没有可以回响的反馈。第一条真实声音，会成为这里的第一道回声。
+        </div>
+        """
+
+    echo_html = f"""
+        <style>
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"], .main {{
+            width: 100vw !important;
+            height: 100dvh !important;
+            min-height: 100dvh !important;
+            overflow: hidden !important;
+            background: #040914 !important;
+        }}
+        .block-container {{
+            width: 100vw !important;
+            height: 100dvh !important;
+            min-height: 100dvh !important;
+            max-width: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            overflow: hidden !important;
+            background: #040914 !important;
+        }}
+        [data-testid="stVerticalBlock"],
+        [data-testid="stElementContainer"],
+        [data-testid="stMarkdownContainer"] {{
+            width: 100vw !important;
+            max-width: none !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"], footer, header {{
+            display: none !important;
+        }}
+        .echo-shell {{
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100dvh;
+            overflow: hidden;
+            background: #040914;
+            z-index: 999;
+        }}
+        .echo-wall {{
+            position: relative;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-image:
+                linear-gradient(90deg, rgba(5,8,18,0.72), rgba(5,8,18,0.18) 58%, rgba(5,8,18,0.06)),
+                url('{hero_uri}');
+            background-size: cover;
+            background-position: center center;
+            color: #f7fbff;
+        }}
+        .echo-wall::after {{
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at 50% 44%, rgba(94,234,212,0.12), transparent 32%);
+            pointer-events: none;
+        }}
+        .echo-back-form {{
+            position: absolute;
+            top: 28px;
+            left: 36px;
+            z-index: 30;
+            margin: 0;
+        }}
+        .echo-back-button,
+        .echo-progress-link {{
+            appearance: none;
+            display: inline-flex;
+            align-items: center;
+            min-height: 33px;
+            padding: 0 14px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.22);
+            background: rgba(8,13,26,0.34);
+            color: #f0f6ff;
+            font: inherit;
+            font-size: 13px;
+            font-weight: 700;
+            text-decoration: none;
+            backdrop-filter: blur(10px);
+            cursor: pointer;
+        }}
+        .echo-progress-link {{
+            position: absolute;
+            top: 28px;
+            right: 36px;
+            z-index: 30;
+        }}
+        .echo-back-button:hover,
+        .echo-progress-link:hover {{
+            background: rgba(94,234,212,0.18);
+            border-color: rgba(94,234,212,0.5);
+            color: #5eead4;
+        }}
+        .echo-title {{
+            position: absolute;
+            left: 40px;
+            top: 78px;
+            z-index: 8;
+            max-width: 520px;
+        }}
+        .echo-title h2 {{
+            margin: 0 0 10px;
+            font-size: 42px;
+            line-height: 1.05;
+            color: #f7fbff;
+        }}
+        .echo-title p {{
+            margin: 0;
+            color: #d5deed;
+            line-height: 1.7;
+            font-size: 15px;
+        }}
+        .echo-card {{
+            position: absolute;
+            z-index: 5;
+            width: min(310px, 34vw);
+            min-height: 118px;
+            transform: translate(-50%, -50%);
+            border: 1px solid rgba(255,255,255,0.16);
+            border-radius: 16px;
+            background: rgba(8,13,26,0.50);
+            backdrop-filter: blur(16px);
+            box-shadow: 0 22px 70px rgba(0,0,0,0.28);
+            padding: 16px 18px;
+            animation: echo-float 7s ease-in-out infinite;
+        }}
+        .echo-card span {{
+            display: inline-flex;
+            color: #5eead4;
+            font-size: 12px;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }}
+        .echo-card strong {{
+            display: block;
+            color: #f7fbff;
+            font-size: 16px;
+            margin-bottom: 8px;
+            line-height: 1.35;
+        }}
+        .echo-card p {{
+            margin: 0;
+            color: #d5deed;
+            font-size: 13px;
+            line-height: 1.65;
+        }}
+        .echo-empty {{
+            position: absolute;
+            left: 40px;
+            bottom: 42px;
+            z-index: 5;
+            max-width: 420px;
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 16px;
+            background: rgba(8,13,26,0.54);
+            color: #d5deed;
+            padding: 18px 20px;
+            backdrop-filter: blur(16px);
+        }}
+        @keyframes echo-float {{
+            0%, 100% {{ transform: translate(-50%, -50%) translateY(0); }}
+            50% {{ transform: translate(-50%, -50%) translateY(-12px); }}
+        }}
+        @media (max-width: 760px) {{
+            .echo-title {{
+                left: 22px;
+                right: 22px;
+                top: 74px;
+            }}
+            .echo-title h2 {{
+                font-size: 32px;
+            }}
+            .echo-card {{
+                width: min(300px, 78vw);
+            }}
+            .echo-card:nth-of-type(n+5) {{
+                display: none;
+            }}
+            .echo-back-form {{
+                left: 22px;
+                top: 22px;
+            }}
+            .echo-progress-link {{
+                right: 22px;
+                top: 22px;
+            }}
+        }}
+        </style>
+        <div class="echo-shell">
+            <div class="echo-wall">
+                <form class="echo-back-form" method="get" action="/">
+                    <button class="echo-back-button" type="submit">← 返回</button>
+                </form>
+                <a class="echo-progress-link" href="?view=workspace&page=progress">查看进度</a>
+                <div class="echo-title">
+                    <h2>回声墙</h2>
+                    <p>每一条反馈都会留下一个更柔和的回响。这里不展示抱怨，而展示那些值得被认真听见的提醒。</p>
+                </div>
+                {''.join(echo_cards)}
+                {empty_text}
+            </div>
+        </div>
+    """
+    st.markdown("\n".join(line.strip() for line in echo_html.splitlines()), unsafe_allow_html=True)
+
+
+def postcard_summary_line(data: dict) -> str:
+    ideas = data["ideas"]
+    if not ideas:
+        return "本周还没有新的员工反馈，建议先用一个轻量入口收集第一批真实声音。"
+    top_category, count = Counter(idea["category"] for idea in ideas).most_common(1)[0]
+    avg_heat = round(sum(idea["heat"] for idea in ideas) / max(len(ideas), 1))
+    return f"本期共收到 {len(ideas)} 条反馈，最集中的议题是「{top_category}」{count} 条，平均热度 {avg_heat}%。"
+
+
+def render_management_postcard(data: dict) -> None:
+    hide_sidebar_for_landing()
+    ideas = data["ideas"]
+    tasks = data["tasks"]
+    hero_uri = image_data_uri(HERO_IMAGE)
+    hot_ideas = sorted(ideas, key=lambda item: item["heat"], reverse=True)[:3]
+    constellations = sorted(build_constellations(ideas), key=lambda item: item["count"], reverse=True)
+    main_constellation = constellations[0] if constellations else None
+    open_tasks = [task for task in tasks if task["status"] in {"待确认", "已受理", "推进中"}]
+    completed = sum(1 for task in tasks if task["status"] == "已完成")
+    response_idea = hot_ideas[0] if hot_ideas else None
+    response_line = make_echo_text(response_idea) if response_idea else "请给员工一个能被看见、能被回应的固定入口。"
+
+    hot_items = []
+    for idea in hot_ideas:
+        hot_items.append(
+            f"""
+            <div class="pc-hot-item">
+                <span>{html.escape(str(idea.get("category", "综合建议")))} · 热度 {int(idea.get("heat", 0) or 0)}%</span>
+                <strong>{html.escape(str(idea.get("title", "未命名反馈")))}</strong>
+            </div>
+            """
+        )
+    if not hot_items:
+        hot_items.append(
+            """
+            <div class="pc-hot-item">
+                <span>等待第一条反馈</span>
+                <strong>先让真实声音有一个落点。</strong>
+            </div>
+            """
+        )
+
+    constellation_name = "尚未形成星座"
+    constellation_detail = "当同类反馈达到 2 条以上，会自动连成共性议题。"
+    constellation_color = "#cbd5e1"
+    if main_constellation:
+        constellation_name = html.escape(str(main_constellation["name"]))
+        constellation_detail = f'{main_constellation["count"]} 颗星 · 平均热度 {main_constellation["avg_heat"]}%'
+        constellation_color = str(main_constellation["color"])
+
+    summary = html.escape(postcard_summary_line(data))
+    response_line = html.escape(response_line)
+    date_text = datetime.now().strftime("%Y.%m.%d")
+
+    postcard_html = f"""
+        <style>
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"], .main {{
+            width: 100vw !important;
+            height: 100dvh !important;
+            min-height: 100dvh !important;
+            overflow: hidden !important;
+            background: #07101a !important;
+        }}
+        .block-container {{
+            width: 100vw !important;
+            height: 100dvh !important;
+            min-height: 100dvh !important;
+            max-width: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            overflow: hidden !important;
+            background: #07101a !important;
+        }}
+        [data-testid="stVerticalBlock"],
+        [data-testid="stElementContainer"],
+        [data-testid="stMarkdownContainer"] {{
+            width: 100vw !important;
+            max-width: none !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"], footer, header {{
+            display: none !important;
+        }}
+        .pc-shell {{
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100dvh;
+            overflow: hidden;
+            z-index: 999;
+            background:
+                linear-gradient(90deg, rgba(5,8,18,0.72), rgba(5,8,18,0.18) 58%, rgba(5,8,18,0.04)),
+                url('{hero_uri}');
+            background-size: cover;
+            background-position: center center;
+            color: #172033;
+        }}
+        .pc-back-form {{
+            position: absolute;
+            top: 28px;
+            left: 36px;
+            z-index: 30;
+            margin: 0;
+        }}
+        .pc-back-button,
+        .pc-progress-link {{
+            appearance: none;
+            display: inline-flex;
+            align-items: center;
+            min-height: 33px;
+            padding: 0 14px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.22);
+            background: rgba(8,13,26,0.34);
+            color: #f0f6ff;
+            font: inherit;
+            font-size: 13px;
+            font-weight: 700;
+            text-decoration: none;
+            backdrop-filter: blur(10px);
+            cursor: pointer;
+        }}
+        .pc-progress-link {{
+            position: absolute;
+            top: 28px;
+            right: 36px;
+            z-index: 30;
+        }}
+        .pc-back-button:hover,
+        .pc-progress-link:hover {{
+            background: rgba(94,234,212,0.18);
+            border-color: rgba(94,234,212,0.5);
+            color: #5eead4;
+        }}
+        .pc-card {{
+            position: absolute;
+            left: 50%;
+            top: 53%;
+            transform: translate(-50%, -50%) rotate(-1.2deg);
+            width: min(1040px, calc(100vw - 96px));
+            height: min(680px, calc(100dvh - 92px));
+            border-radius: 8px;
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.96), rgba(232,241,247,0.92)),
+                #f7fbff;
+            box-shadow: 0 34px 110px rgba(0,0,0,0.44);
+            overflow: hidden;
+            display: grid;
+            grid-template-columns: 0.92fr 1.08fr;
+        }}
+        .pc-photo {{
+            position: relative;
+            min-height: 100%;
+            background:
+                linear-gradient(0deg, rgba(5,8,18,0.62), rgba(5,8,18,0.12)),
+                url('{hero_uri}');
+            background-size: cover;
+            background-position: center center;
+            color: #f7fbff;
+            padding: 28px;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+        }}
+        .pc-photo::before {{
+            content: "";
+            position: absolute;
+            inset: 18px;
+            border: 1px solid rgba(255,255,255,0.25);
+            pointer-events: none;
+        }}
+        .pc-photo h2 {{
+            position: relative;
+            margin: 0 0 10px;
+            font-size: 34px;
+            line-height: 1.05;
+            color: #f7fbff;
+        }}
+        .pc-photo p {{
+            position: relative;
+            margin: 0;
+            color: #dbeafe;
+            line-height: 1.65;
+            font-size: 13px;
+        }}
+        .pc-content {{
+            position: relative;
+            padding: 24px 30px 24px;
+            background-image:
+                linear-gradient(rgba(15,23,42,0.055) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(15,23,42,0.04) 1px, transparent 1px);
+            background-size: 28px 28px;
+        }}
+        .pc-stamp {{
+            position: absolute;
+            right: 34px;
+            top: 24px;
+            width: 92px;
+            height: 72px;
+            border: 2px dashed rgba(15,23,42,0.35);
+            border-radius: 8px;
+            display: grid;
+            place-items: center;
+            color: #334155;
+            font-weight: 900;
+            font-size: 13px;
+            text-align: center;
+            transform: rotate(3deg);
+        }}
+        .pc-kicker {{
+            color: #64748b;
+            font-size: 13px;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 0.08em !important;
+            margin-bottom: 8px;
+        }}
+        .pc-content h1 {{
+            color: #0f172a;
+            margin: 0 108px 12px 0;
+            font-size: 31px;
+            line-height: 1.08;
+        }}
+        .pc-summary {{
+            color: #334155;
+            font-size: 13px;
+            line-height: 1.62;
+            margin: 0 0 12px;
+            max-width: 620px;
+        }}
+        .pc-metrics {{
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            margin: 12px 0;
+        }}
+        .pc-metric {{
+            border: 1px solid rgba(15,23,42,0.12);
+            border-radius: 8px;
+            background: rgba(255,255,255,0.58);
+            padding: 9px 10px;
+        }}
+        .pc-metric span {{
+            display: block;
+            color: #64748b;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }}
+        .pc-metric strong {{
+            color: #0f172a;
+            font-size: 22px;
+        }}
+        .pc-section-title {{
+            color: #0f172a;
+            font-size: 15px;
+            font-weight: 900;
+            margin: 12px 0 7px;
+        }}
+        .pc-hot-list {{
+            display: grid;
+            gap: 6px;
+        }}
+        .pc-hot-item {{
+            border-left: 3px solid #5eead4;
+            padding: 7px 10px;
+            background: rgba(15,23,42,0.045);
+            border-radius: 0 8px 8px 0;
+        }}
+        .pc-hot-item span {{
+            display: block;
+            color: #64748b;
+            font-size: 12px;
+            margin-bottom: 2px;
+        }}
+        .pc-hot-item strong {{
+            color: #172033;
+            font-size: 13px;
+            line-height: 1.35;
+        }}
+        .pc-constellation {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border: 1px solid rgba(15,23,42,0.12);
+            background: rgba(255,255,255,0.62);
+            border-radius: 8px;
+            padding: 10px 12px;
+        }}
+        .pc-constellation-dot {{
+            width: 14px;
+            height: 14px;
+            border-radius: 999px;
+            background: {constellation_color};
+            box-shadow: 0 0 16px {constellation_color};
+            flex: 0 0 auto;
+        }}
+        .pc-constellation strong {{
+            display: block;
+            color: #0f172a;
+            font-size: 15px;
+        }}
+        .pc-constellation span {{
+            display: block;
+            color: #64748b;
+            font-size: 12px;
+            margin-top: 2px;
+        }}
+        .pc-response {{
+            margin-top: 10px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: rgba(94,234,212,0.13);
+            color: #0f172a;
+            line-height: 1.55;
+            font-weight: 750;
+            font-size: 13px;
+        }}
+        .pc-bottom-grid {{
+            display: grid;
+            grid-template-columns: 0.9fr 1.1fr;
+            gap: 10px;
+            align-items: stretch;
+            margin-top: 12px;
+        }}
+        .pc-bottom-grid .pc-section-title {{
+            margin-top: 0;
+        }}
+        .pc-bottom-grid .pc-response {{
+            margin-top: 0;
+            height: calc(100% - 30px);
+        }}
+        .pc-signoff {{
+            position: absolute;
+            right: 38px;
+            bottom: 18px;
+            color: #64748b;
+            font-size: 12px;
+            text-align: right;
+        }}
+        @media (max-width: 820px) {{
+            .pc-card {{
+                top: 54%;
+                width: calc(100vw - 36px);
+                min-height: calc(100dvh - 110px);
+                grid-template-columns: 1fr;
+                overflow: auto;
+                transform: translate(-50%, -50%);
+            }}
+            .pc-photo {{
+                min-height: 210px;
+            }}
+            .pc-content {{
+                padding: 24px;
+            }}
+            .pc-content h1 {{
+                margin-right: 0;
+                font-size: 30px;
+            }}
+            .pc-stamp {{
+                display: none;
+            }}
+            .pc-metrics {{
+                grid-template-columns: 1fr;
+            }}
+            .pc-signoff {{
+                position: static;
+                margin-top: 18px;
+                text-align: left;
+            }}
+        }}
+        </style>
+        <div class="pc-shell">
+            <form class="pc-back-form" method="get" action="/">
+                <button class="pc-back-button" type="submit">← 返回</button>
+            </form>
+            <a class="pc-progress-link" href="?view=workspace&page=progress">查看进度</a>
+            <section class="pc-card">
+                <div class="pc-photo">
+                    <h2>From Fuji</h2>
+                    <p>把员工反馈整理成一张能被快速阅读、截图转发、用于决策沟通的明信片。</p>
+                </div>
+                <div class="pc-content">
+                    <div class="pc-stamp">STELLAR<br>{date_text}</div>
+                    <div class="pc-kicker">To Management</div>
+                    <h1>本周员工声音明信片</h1>
+                    <p class="pc-summary">{summary}</p>
+                    <div class="pc-metrics">
+                        <div class="pc-metric"><span>反馈总数</span><strong>{len(ideas)}</strong></div>
+                        <div class="pc-metric"><span>开放事项</span><strong>{len(open_tasks)}</strong></div>
+                        <div class="pc-metric"><span>已完成</span><strong>{completed}</strong></div>
+                    </div>
+                    <div class="pc-section-title">最亮的 3 颗星</div>
+                    <div class="pc-hot-list">{''.join(hot_items)}</div>
+                    <div class="pc-bottom-grid">
+                        <div>
+                            <div class="pc-section-title">最大星座</div>
+                            <div class="pc-constellation">
+                                <span class="pc-constellation-dot"></span>
+                                <div><strong>{constellation_name}</strong><span>{constellation_detail}</span></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="pc-section-title">最需要回应的一句话</div>
+                            <div class="pc-response">{response_line}</div>
+                        </div>
+                    </div>
+                    <div class="pc-signoff">Stellar · 员工反馈与协同<br>{now_str()}</div>
+                </div>
+            </section>
+        </div>
+    """
+    st.markdown("\n".join(line.strip() for line in postcard_html.splitlines()), unsafe_allow_html=True)
 
 
 def render_settings_panel() -> None:
@@ -2048,6 +3432,50 @@ def sidebar(data: dict) -> None:
         render_settings_panel()
 
 
+def handle_feedback_actions(data: dict) -> None:
+    action = st.query_params.get("op", "") or st.query_params.get("action", "")
+    idea_id = st.query_params.get("idea", "")
+    if action not in {"like", "delete"} or not idea_id:
+        return
+
+    idea = next((item for item in data["ideas"] if item["id"] == idea_id), None)
+    if not idea:
+        st.query_params.clear()
+        st.query_params["view"] = "workspace"
+        st.query_params["page"] = "progress"
+        st.rerun()
+
+    if action == "like":
+        token = get_session_token()
+        voters = set(idea.get("voters") or [])
+        if token not in voters:
+            idea["votes"] = max(0, int(idea.get("votes", 0) or 0)) + 1
+            voters.add(token)
+            idea["voters"] = list(voters)
+            refresh_idea_heat_scores(data["ideas"])
+            liked_idea_ids().add(idea_id)
+            save_data(data)
+            st.toast("已赞同，这条反馈的热度已更新。")
+        else:
+            liked_idea_ids().add(idea_id)
+            st.toast("你已经赞同过这条反馈了。")
+
+    if action == "delete":
+        if idea.get("delete_code"):
+            st.session_state["pending_delete_id"] = idea_id
+            st.query_params.clear()
+            st.query_params["view"] = "workspace"
+            st.query_params["page"] = "progress"
+            st.rerun()
+        else:
+            st.toast("该反馈未设置删除码，无法删除。")
+
+    st.query_params.clear()
+    st.query_params["view"] = "workspace"
+    st.query_params["page"] = "progress"
+    st.rerun()
+
+
 def main() -> None:
     st.set_page_config(
         page_title=f"{APP_TITLE} · 反馈与跟进",
@@ -2057,6 +3485,14 @@ def main() -> None:
     )
     inject_css()
     data = load_data()
+    token = get_session_token()
+    for idea in data.get("ideas", []):
+        if token in (idea.get("voters") or []):
+            liked_idea_ids().add(str(idea["id"]))
+    handle_feedback_actions(data)
+    pending_toast = st.session_state.pop("pending_toast", "")
+    if pending_toast:
+        st.toast(pending_toast)
     if "view" not in st.session_state:
         st.session_state["view"] = "landing"
     qv = st.query_params.get("view")
@@ -2064,6 +3500,10 @@ def main() -> None:
         st.session_state["view"] = "workspace"
     elif qv == "stars":
         st.session_state["view"] = "stars"
+    elif qv == "echoes":
+        st.session_state["view"] = "echoes"
+    elif qv == "postcard":
+        st.session_state["view"] = "postcard"
     elif qv == "landing":
         st.session_state["view"] = "landing"
         st.query_params.clear()
@@ -2076,13 +3516,27 @@ def main() -> None:
         render_star_page(data)
         return
 
+    if st.session_state["view"] == "echoes" or st.query_params.get("page") == "echoes":
+        render_echo_wall(data)
+        return
+
+    if st.session_state["view"] == "postcard" or st.query_params.get("page") == "postcard":
+        render_management_postcard(data)
+        return
+
     sidebar(data)
     page_param = st.query_params.get("page")
-    default_page = {"progress": "查看进度"}.get(page_param, "提交反馈")
-    page = st.segmented_control("页面", ["提交反馈", "查看进度", "星空意见图"], default=default_page)
+    default_page = {"progress": "查看进度", "echoes": "回声墙", "postcard": "管理层明信片"}.get(page_param, "提交反馈")
+    page = st.segmented_control("页面", ["提交反馈", "查看进度", "星空意见图", "回声墙", "管理层明信片"], default=default_page)
     if page == "星空意见图":
         st.query_params["view"] = "workspace"
         st.query_params["page"] = "stars"
+        st.rerun()
+    if page == "回声墙":
+        st.query_params["view"] = "echoes"
+        st.rerun()
+    if page == "管理层明信片":
+        st.query_params["view"] = "postcard"
         st.rerun()
     render_hero(data)
     if page == "提交反馈":
