@@ -2695,7 +2695,7 @@ def render_star_page(data: dict) -> None:
                     <p>把分散的想法放在同一片天空里，方便大家查看和跟进。</p>
                     {empty_text}
                 </div>
-                <form class="sp-back-form" method="get" action="/">
+                <form class="sp-back-form" method="get" action="/" target="_parent">
                     <button class="sp-back-button" type="submit">← 返回</button>
                 </form>
                 <div class="sp-view-tools">
@@ -2956,10 +2956,10 @@ def render_echo_wall(data: dict) -> None:
         </style>
         <div class="echo-shell">
             <div class="echo-wall">
-                <form class="echo-back-form" method="get" action="/">
+                <form class="echo-back-form" method="get" action="/" target="_parent">
                     <button class="echo-back-button" type="submit">← 返回</button>
                 </form>
-                <a class="echo-progress-link" href="?view=workspace&page=progress">查看进度</a>
+                <a class="echo-progress-link" href="?view=workspace&page=progress" target="_parent">查看进度</a>
                 <div class="echo-title">
                     <h2>回声墙</h2>
                     <p>每一条反馈都会留下一个更柔和的回响。这里不展示抱怨，而展示那些值得被认真听见的提醒。</p>
@@ -3345,10 +3345,10 @@ def render_management_postcard(data: dict) -> None:
         }}
         </style>
         <div class="pc-shell">
-            <form class="pc-back-form" method="get" action="/">
+            <form class="pc-back-form" method="get" action="/" target="_parent">
                 <button class="pc-back-button" type="submit">← 返回</button>
             </form>
-            <a class="pc-progress-link" href="?view=workspace&page=progress">查看进度</a>
+            <a class="pc-progress-link" href="?view=workspace&page=progress" target="_parent">查看进度</a>
             <section class="pc-card">
                 <div class="pc-photo">
                     <h2>From Fuji</h2>

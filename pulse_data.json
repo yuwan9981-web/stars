@@ -10,16 +10,20 @@
       "impact": "建议将该问题作为可跟踪事项处理：先明确影响范围与负责人，再围绕“议公司增加工作期间的福利供给，如引进咖啡机提供免费咖啡，利用一楼空间打造咖啡室，既能”形成执行动作，并在固定周期内反馈处理进展。",
       "status": "待确认",
       "base_heat": 64,
-      "heat": 57,
-      "votes": 1,
+      "heat": 62,
+      "votes": 3,
       "created_at": "2026-06-23 22:12",
       "heat_factors": {
         "impact": 92,
         "urgency": 56,
-        "resonance": 23,
+        "resonance": 46,
         "duplication": 0,
         "actionability": 92
-      }
+      },
+      "voters": [
+        "a2ad0d25529d4d24b187498b31bd7d23",
+        "502b5a9aec6842de88a4106a6fc49e8b"
+      ]
     },
     {
       "id": "idea-0c4e2d8a",
@@ -31,16 +35,19 @@
       "impact": "评估费用和空间，制定咖啡机与咖啡室预算方案，征求员工意见后试点。",
       "status": "待确认",
       "base_heat": 65,
-      "heat": 57,
-      "votes": 1,
+      "heat": 60,
+      "votes": 2,
       "created_at": "2026-06-23 21:59",
       "heat_factors": {
         "impact": 92,
         "urgency": 56,
-        "resonance": 23,
+        "resonance": 37,
         "duplication": 0,
         "actionability": 92
-      }
+      },
+      "voters": [
+        "838a1400b5b4457b9771f57b3d8320ea"
+      ]
     }
   ],
   "tasks": [
