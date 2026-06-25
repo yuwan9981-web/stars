@@ -543,6 +543,34 @@ def inject_css() -> None:
         .block-container {
             padding-top: 2.2rem;
             max-width: 1280px;
+            animation: stellarPageIn 0.45s ease-out both;
+        }
+
+        /* opacity-only: transform on this ancestor would break the
+           position:fixed full-page shells (landing/star/echo/postcard). */
+        @keyframes stellarPageIn {
+            from { opacity: 0; }
+            to   { opacity: 1; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .block-container { animation: none; }
+        }
+
+        /* Slide-up on the page-level containers. transform here is safe:
+           on the fixed shells it applies to the element itself (not an
+           ancestor), so it doesn't disturb their viewport positioning. */
+        .landing-shell, .star-shell, .echo-shell, .pc-shell, .hero {
+            animation: stellarRise 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+
+        @keyframes stellarRise {
+            from { transform: translateY(18px); }
+            to   { transform: translateY(0); }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .landing-shell, .star-shell, .echo-shell, .pc-shell, .hero { animation: none; }
         }
 
         h1, h2, h3, p, label, span, div {
