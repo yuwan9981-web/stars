@@ -2153,56 +2153,6 @@ def build_constellations(ideas: list[dict]) -> list[dict]:
     return constellations
 
 
-def render_star_map(data: dict) -> None:
-    st.markdown('<div class="section-title">星空意见图</div>', unsafe_allow_html=True)
-    st.caption("每颗星代表一条员工反馈。点开星星查看详情。")
-    ideas = data["ideas"]
-    hero_uri = image_data_uri(NIGHT_HERO_IMAGE)
-    selected_id = st.query_params.get("idea", "")
-
-    star_links = []
-    for index, idea in enumerate(ideas):
-        x, y = star_position(index)
-        title = idea["title"].replace('"', "&quot;")
-        star_links.append(
-            f'<a class="star-link" style="left:{x}%; top:{y}%;" '
-            f'href="?view=workspace&page=stars&idea={idea["id"]}" title="{title}">{title}</a>'
-        )
-
-    empty_text = "" if ideas else "<p class='muted'>还没有反馈。提交第一条后，这里会出现第一颗星。</p>"
-    st.markdown(
-        f"""
-        <div class="star-map" style="background-image: url('{hero_uri}');">
-            <div class="star-map-title">
-                <h2>意见像星星一样被看见</h2>
-                <p>把分散的想法放在同一片天空里，方便大家查看和跟进。</p>
-                {empty_text}
-            </div>
-            {''.join(star_links)}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    selected = next((idea for idea in ideas if idea["id"] == selected_id), None)
-    if selected:
-        color = status_color(selected["status"])
-        st.markdown(
-            f"""
-            <div class="star-detail">
-                <span class="tag">{selected["category"]}</span>
-                <span class="tag" style="border-color:{color}; color:{color};">{selected["status"]}</span>
-                <span class="tag">热度 {selected["heat"]}%</span>
-                <div class="idea-title">{selected["title"]}</div>
-                <p>{selected["content"]}</p>
-                <p class="muted">希望改进：{selected["impact"]}</p>
-                <p class="muted">提交时间：{selected["created_at"]}</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
 def render_star_page(data: dict) -> None:
     hide_sidebar_for_landing()
     ideas = data["ideas"]
@@ -2695,7 +2645,8 @@ def render_star_page(data: dict) -> None:
                     <p>把分散的想法放在同一片天空里，方便大家查看和跟进。</p>
                     {empty_text}
                 </div>
-                <form class="sp-back-form" method="get" action="/" target="_parent">
+                <form class="sp-back-form" method="get">
+                    <input type="hidden" name="view" value="landing">
                     <button class="sp-back-button" type="submit">← 返回</button>
                 </form>
                 <div class="sp-view-tools">
@@ -2956,10 +2907,15 @@ def render_echo_wall(data: dict) -> None:
         </style>
         <div class="echo-shell">
             <div class="echo-wall">
-                <form class="echo-back-form" method="get" action="/" target="_parent">
+                <form class="echo-back-form" method="get">
+                    <input type="hidden" name="view" value="landing">
                     <button class="echo-back-button" type="submit">← 返回</button>
                 </form>
-                <a class="echo-progress-link" href="?view=workspace&page=progress" target="_parent">查看进度</a>
+                <form method="get" style="margin:0;">
+                    <input type="hidden" name="view" value="workspace">
+                    <input type="hidden" name="page" value="progress">
+                    <button class="echo-progress-link" type="submit">查看进度</button>
+                </form>
                 <div class="echo-title">
                     <h2>回声墙</h2>
                     <p>每一条反馈都会留下一个更柔和的回响。这里不展示抱怨，而展示那些值得被认真听见的提醒。</p>
@@ -3345,10 +3301,15 @@ def render_management_postcard(data: dict) -> None:
         }}
         </style>
         <div class="pc-shell">
-            <form class="pc-back-form" method="get" action="/" target="_parent">
+            <form class="pc-back-form" method="get">
+                <input type="hidden" name="view" value="landing">
                 <button class="pc-back-button" type="submit">← 返回</button>
             </form>
-            <a class="pc-progress-link" href="?view=workspace&page=progress" target="_parent">查看进度</a>
+            <form method="get" style="margin:0;">
+                <input type="hidden" name="view" value="workspace">
+                <input type="hidden" name="page" value="progress">
+                <button class="pc-progress-link" type="submit">查看进度</button>
+            </form>
             <section class="pc-card">
                 <div class="pc-photo">
                     <h2>From Fuji</h2>
