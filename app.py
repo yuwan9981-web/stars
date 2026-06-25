@@ -19,8 +19,8 @@ import streamlit as st
 APP_TITLE = "Stellar"
 DATA_FILE = Path("pulse_data.json")
 SUPABASE_TABLE = "stellar_data"
-HERO_IMAGE = Path("assets/fuji-hero.png")
-NIGHT_HERO_IMAGE = Path("assets/fuji-night-stars.png")
+HERO_IMAGE = Path("assets/fuji-hero.webp")
+NIGHT_HERO_IMAGE = Path("assets/fuji-night-stars.webp")
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_FALLBACK_MODELS = ["gemini-2.0-flash"]
 LEGACY_GEMINI_MODELS = {"gemini-3.5-flash"}
@@ -269,6 +269,7 @@ def save_remote_data(data: dict) -> bool:
         return False
 
 
+@st.cache_data(show_spinner=False)
 def image_data_uri(path: Path) -> str:
     if not path.exists():
         return ""
