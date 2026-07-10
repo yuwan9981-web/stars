@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
+import hmac
 import json
 import math
 import os
@@ -19,6 +21,10 @@ import streamlit as st
 APP_TITLE = "Stellar"
 DATA_FILE = Path("pulse_data.json")
 SUPABASE_TABLE = "stellar_data"
+SUPABASE_IDEAS_TABLE = "stellar_ideas"
+SUPABASE_VOTES_TABLE = "stellar_votes"
+SUPABASE_TASKS_TABLE = "stellar_tasks"
+SUPABASE_HISTORY_TABLE = "stellar_status_history"
 HERO_IMAGE = Path("assets/fuji-hero.webp")
 NIGHT_HERO_IMAGE = Path("assets/fuji-night-stars.webp")
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -63,8 +69,40 @@ def extract_topic_tokens(text: str) -> set[str]:
     keywords = {
         "沟通", "信息", "同步", "流程", "负责人", "活动", "团建", "补贴", "奖金", "加班",
         "晋升", "培训", "反馈", "协作", "会议", "预算", "分工", "透明", "权益", "效率",
+        "福利", "咖啡", "休息", "环境", "空间", "设备", "餐饮", "交通", "报销",
     }
     return {keyword for keyword in keywords if keyword in text}
+
+
+def text_bigrams(text: str) -> set[str]:
+    compact = re.sub(r"\s+", "", text)
+    return {compact[index : index + 2] for index in range(max(0, len(compact) - 1))}
+
+
+def idea_similarity(candidate: dict, existing: dict) -> float:
+    candidate_text = f"{candidate.get('title', '')} {candidate.get('content', '')} {candidate.get('impact', '')}"
+    existing_text = f"{existing.get('title', '')} {existing.get('content', '')} {existing.get('impact', '')}"
+    candidate_tokens = extract_topic_tokens(candidate_text)
+    existing_tokens = extract_topic_tokens(existing_text)
+    token_union = candidate_tokens | existing_tokens
+    token_score = len(candidate_tokens & existing_tokens) / len(token_union) if token_union else 0.0
+    candidate_bigrams = text_bigrams(str(candidate.get("title", "")))
+    existing_bigrams = text_bigrams(str(existing.get("title", "")))
+    bigram_union = candidate_bigrams | existing_bigrams
+    title_score = len(candidate_bigrams & existing_bigrams) / len(bigram_union) if bigram_union else 0.0
+    category_score = 1.0 if candidate.get("category") == existing.get("category") else 0.0
+    return round(category_score * 0.35 + token_score * 0.45 + title_score * 0.20, 3)
+
+
+def find_similar_ideas(candidate: dict, ideas: list[dict], threshold: float = 0.42) -> list[tuple[dict, float]]:
+    matches = []
+    for idea in ideas:
+        if idea.get("merged_into_id"):
+            continue
+        score = idea_similarity(candidate, idea)
+        if score >= threshold:
+            matches.append((idea, score))
+    return sorted(matches, key=lambda item: (item[1], item[0].get("heat", 0)), reverse=True)[:3]
 
 
 def calculate_heat_factors(idea: dict, all_ideas: list[dict] | None = None) -> dict:
@@ -148,6 +186,12 @@ def normalize_idea(idea: dict) -> dict:
     normalized["base_heat"] = int(normalized.get("base_heat", normalized.get("heat", 64)) or 64)
     normalized["votes"] = max(0, int(normalized.get("votes", 0) or 0))
     normalized["voters"] = list(normalized.get("voters") or [])
+    normalized["owner"] = str(normalized.get("owner") or "待确认")
+    normalized["management_response"] = str(normalized.get("management_response") or "")
+    normalized["next_update_at"] = str(normalized.get("next_update_at") or "")
+    normalized["merged_into_id"] = str(normalized.get("merged_into_id") or "")
+    normalized["delete_code_hash"] = str(normalized.get("delete_code_hash") or "")
+    normalized["history"] = list(normalized.get("history") or [])
     normalized["heat"] = recalculate_idea_heat(normalized)
     normalized["created_at"] = str(normalized.get("created_at") or now_str())
     return normalized
@@ -216,6 +260,277 @@ def supabase_headers(key: str) -> dict:
     }
 
 
+def hash_delete_code(code: str, idea_id: str) -> str:
+    salt = get_secret_value("DELETE_CODE_SALT") or get_secret_value("ADMIN_PASSWORD") or "stellar-local-salt"
+    return hashlib.sha256(f"{salt}:{idea_id}:{code}".encode("utf-8")).hexdigest()
+
+
+def verify_delete_code(idea: dict, entered: str) -> bool:
+    stored_hash = str(idea.get("delete_code_hash") or "")
+    if stored_hash:
+        return hmac.compare_digest(stored_hash, hash_delete_code(entered, str(idea["id"])))
+    return hmac.compare_digest(str(idea.get("delete_code") or ""), entered)
+
+
+def supabase_get(url: str, key: str, table: str, params: dict | None = None) -> list[dict]:
+    response = requests.get(
+        f"{url}/rest/v1/{table}",
+        headers=supabase_headers(key),
+        params=params or {"select": "*"},
+        timeout=12,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def supabase_upsert(url: str, key: str, table: str, rows: list[dict] | dict) -> None:
+    if not rows:
+        return
+    response = requests.post(
+        f"{url}/rest/v1/{table}",
+        headers={**supabase_headers(key), "Prefer": "resolution=merge-duplicates,return=minimal"},
+        json=rows,
+        timeout=12,
+    )
+    response.raise_for_status()
+
+
+def normalized_supabase_available(url: str, key: str) -> bool:
+    try:
+        supabase_get(url, key, SUPABASE_IDEAS_TABLE, {"select": "id", "limit": "1"})
+        return True
+    except Exception:
+        return False
+
+
+def idea_to_supabase_row(idea: dict) -> dict:
+    normalized = normalize_idea(idea)
+    delete_hash = normalized.get("delete_code_hash", "")
+    if not delete_hash and normalized.get("delete_code"):
+        delete_hash = hash_delete_code(str(normalized["delete_code"]), normalized["id"])
+    return {
+        "id": normalized["id"],
+        "title": normalized["title"],
+        "category": normalized["category"],
+        "author": normalized["author"],
+        "anonymous": normalized["anonymous"],
+        "content": normalized["content"],
+        "impact": normalized["impact"],
+        "status": normalized["status"],
+        "owner": normalized["owner"],
+        "management_response": normalized["management_response"],
+        "next_update_at": normalized["next_update_at"],
+        "merged_into_id": normalized["merged_into_id"] or None,
+        "base_heat": normalized["base_heat"],
+        "heat": normalized["heat"],
+        "votes": normalized["votes"],
+        "heat_factors": normalized.get("heat_factors", {}),
+        "delete_code_hash": delete_hash,
+        "created_at": normalized["created_at"],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def task_to_supabase_row(task: dict) -> dict:
+    normalized = normalize_task(task)
+    return {
+        "id": normalized["id"],
+        "name": normalized["name"],
+        "owner": normalized["owner"],
+        "status": normalized["status"],
+        "priority": normalized["priority"],
+        "progress": normalized["progress"],
+        "due": normalized["due"],
+        "reward": normalized["reward"],
+        "members": normalized["members"],
+        "next_step": normalized["next_step"],
+        "plan": normalized.get("plan", ""),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def load_legacy_remote_data(url: str, key: str) -> dict | None:
+    try:
+        rows = supabase_get(url, key, SUPABASE_TABLE, {"select": "data", "id": "eq.main"})
+        return normalize_data(rows[0].get("data")) if rows else None
+    except Exception:
+        return None
+
+
+def migrate_legacy_to_normalized(url: str, key: str, legacy: dict) -> None:
+    normalized = normalize_data(legacy)
+    supabase_upsert(url, key, SUPABASE_IDEAS_TABLE, [idea_to_supabase_row(idea) for idea in normalized["ideas"]])
+    supabase_upsert(url, key, SUPABASE_TASKS_TABLE, [task_to_supabase_row(task) for task in normalized["tasks"]])
+    vote_rows = []
+    history_rows = []
+    for idea in normalized["ideas"]:
+        vote_rows.extend({"idea_id": idea["id"], "voter_token": token} for token in idea.get("voters", []))
+        history = idea.get("history") or [
+            {
+                "from_status": "",
+                "to_status": idea["status"],
+                "response": "反馈已从旧数据迁移。",
+                "owner": idea.get("owner", "待确认"),
+                "actor": "系统迁移",
+                "created_at": idea["created_at"],
+            }
+        ]
+        history_rows.extend({"idea_id": idea["id"], **event} for event in history)
+    supabase_upsert(url, key, SUPABASE_VOTES_TABLE, vote_rows)
+    supabase_upsert(url, key, SUPABASE_HISTORY_TABLE, history_rows)
+
+
+def load_normalized_remote_data(url: str, key: str) -> dict:
+    idea_rows = supabase_get(url, key, SUPABASE_IDEAS_TABLE, {"select": "*", "order": "created_at.desc"})
+    if not idea_rows:
+        legacy = load_legacy_remote_data(url, key)
+        if legacy and (legacy.get("ideas") or legacy.get("tasks")):
+            migrate_legacy_to_normalized(url, key, legacy)
+            idea_rows = supabase_get(url, key, SUPABASE_IDEAS_TABLE, {"select": "*", "order": "created_at.desc"})
+    task_rows = supabase_get(url, key, SUPABASE_TASKS_TABLE, {"select": "*", "order": "created_at.desc"})
+    history_rows = supabase_get(url, key, SUPABASE_HISTORY_TABLE, {"select": "*", "order": "created_at.asc"})
+    token = get_session_token()
+    own_votes = supabase_get(
+        url,
+        key,
+        SUPABASE_VOTES_TABLE,
+        {"select": "idea_id", "voter_token": f"eq.{token}"},
+    )
+    voted_ids = {row["idea_id"] for row in own_votes}
+    history_by_idea: dict[str, list[dict]] = {}
+    for row in history_rows:
+        history_by_idea.setdefault(str(row["idea_id"]), []).append(row)
+    ideas = []
+    for row in idea_rows:
+        idea = normalize_idea(row)
+        idea["history"] = history_by_idea.get(idea["id"], [])
+        idea["voters"] = [token] if idea["id"] in voted_ids else []
+        ideas.append(idea)
+    legacy = load_legacy_remote_data(url, key) or DEFAULT_DATA
+    return normalize_data(
+        {
+            **legacy,
+            "ideas": ideas,
+            "tasks": [normalize_task(row) for row in task_rows],
+        }
+    )
+
+
+def save_normalized_remote_data(url: str, key: str, data: dict) -> None:
+    normalized = normalize_data(data)
+    supabase_upsert(url, key, SUPABASE_IDEAS_TABLE, [idea_to_supabase_row(idea) for idea in normalized["ideas"]])
+    supabase_upsert(url, key, SUPABASE_TASKS_TABLE, [task_to_supabase_row(task) for task in normalized["tasks"]])
+
+
+def get_normalized_supabase_config() -> tuple[str, str] | None:
+    url, key = get_supabase_config()
+    if url and key and normalized_supabase_available(url, key):
+        return url, key
+    return None
+
+
+def supabase_patch(url: str, key: str, table: str, filters: dict, payload: dict) -> None:
+    response = requests.patch(
+        f"{url}/rest/v1/{table}",
+        headers={**supabase_headers(key), "Prefer": "return=minimal"},
+        params=filters,
+        json=payload,
+        timeout=12,
+    )
+    response.raise_for_status()
+
+
+def supabase_delete(url: str, key: str, table: str, filters: dict) -> None:
+    response = requests.delete(
+        f"{url}/rest/v1/{table}",
+        headers=supabase_headers(key),
+        params=filters,
+        timeout=12,
+    )
+    response.raise_for_status()
+
+
+def persist_new_idea(data: dict, idea: dict) -> None:
+    config = get_normalized_supabase_config()
+    if not config:
+        save_data(data)
+        return
+    url, key = config
+    supabase_upsert(url, key, SUPABASE_IDEAS_TABLE, idea_to_supabase_row(idea))
+    initial_event = (idea.get("history") or [{}])[0]
+    supabase_upsert(
+        url,
+        key,
+        SUPABASE_HISTORY_TABLE,
+        {
+            "idea_id": idea["id"],
+            "from_status": initial_event.get("from_status", ""),
+            "to_status": initial_event.get("to_status", idea["status"]),
+            "response": initial_event.get("response", "反馈已提交，等待确认。"),
+            "owner": initial_event.get("owner", idea.get("owner", "待确认")),
+            "actor": initial_event.get("actor", "系统"),
+            "created_at": initial_event.get("created_at", idea["created_at"]),
+        },
+    )
+
+
+def persist_vote(idea: dict, token: str, data: dict) -> bool:
+    config = get_normalized_supabase_config()
+    if not config:
+        voters = set(idea.get("voters") or [])
+        if token in voters:
+            return False
+        idea["votes"] = max(0, int(idea.get("votes", 0) or 0)) + 1
+        voters.add(token)
+        idea["voters"] = list(voters)
+        refresh_idea_heat_scores(data["ideas"])
+        save_data(data)
+        return True
+    url, key = config
+    response = requests.post(
+        f"{url}/rest/v1/rpc/stellar_cast_vote",
+        headers=supabase_headers(key),
+        json={"p_idea_id": idea["id"], "p_voter_token": token},
+        timeout=12,
+    )
+    response.raise_for_status()
+    return bool(response.json())
+
+
+def persist_delete_idea(data: dict, idea_id: str) -> None:
+    config = get_normalized_supabase_config()
+    if config:
+        url, key = config
+        supabase_delete(url, key, SUPABASE_IDEAS_TABLE, {"id": f"eq.{idea_id}"})
+    else:
+        data["ideas"] = [idea for idea in data["ideas"] if idea["id"] != idea_id]
+        save_data(data)
+
+
+def persist_management_update(idea: dict, event: dict, data: dict) -> None:
+    config = get_normalized_supabase_config()
+    if config:
+        url, key = config
+        supabase_patch(
+            url,
+            key,
+            SUPABASE_IDEAS_TABLE,
+            {"id": f"eq.{idea['id']}"},
+            {
+                "status": idea["status"],
+                "owner": idea["owner"],
+                "management_response": idea["management_response"],
+                "next_update_at": idea["next_update_at"],
+                "merged_into_id": idea.get("merged_into_id") or None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        supabase_upsert(url, key, SUPABASE_HISTORY_TABLE, {"idea_id": idea["id"], **event})
+    else:
+        idea.setdefault("history", []).append(event)
+        save_data(data)
+
+
 def normalize_data(data: dict | None) -> dict:
     normalized = json.loads(json.dumps(DEFAULT_DATA))
     if isinstance(data, dict):
@@ -233,19 +548,14 @@ def load_remote_data() -> dict | None:
     if not url or not key:
         return None
     try:
-        response = requests.get(
-            f"{url}/rest/v1/{SUPABASE_TABLE}",
-            headers=supabase_headers(key),
-            params={"select": "data", "id": "eq.main"},
-            timeout=12,
-        )
-        response.raise_for_status()
-        rows = response.json()
-        if not rows:
-            data = normalize_data(DEFAULT_DATA)
-            save_remote_data(data)
-            return data
-        return normalize_data(rows[0].get("data"))
+        if normalized_supabase_available(url, key):
+            return load_normalized_remote_data(url, key)
+        legacy = load_legacy_remote_data(url, key)
+        if legacy is not None:
+            return legacy
+        data = normalize_data(DEFAULT_DATA)
+        save_remote_data(data)
+        return data
     except Exception as exc:
         st.warning(f"远程数据读取失败，已使用本地数据：{exc}")
         return None
@@ -256,6 +566,9 @@ def save_remote_data(data: dict) -> bool:
     if not url or not key:
         return False
     try:
+        if normalized_supabase_available(url, key):
+            save_normalized_remote_data(url, key, data)
+            return True
         response = requests.post(
             f"{url}/rest/v1/{SUPABASE_TABLE}",
             headers={**supabase_headers(key), "Prefer": "resolution=merge-duplicates,return=minimal"},
@@ -501,6 +814,7 @@ def status_color(status: str) -> str:
         "推进中": "#7c8cff",
         "已完成": "#60d394",
         "暂缓": "#ff6b6b",
+        "已合并": "#cbd5e1",
     }.get(status, "#94a3b8")
 
 
@@ -737,6 +1051,58 @@ def inject_css() -> None:
             color: #cbd5e1;
         }
 
+        .management-response {
+            margin-top: 12px;
+            padding: 12px 14px;
+            border-left: 3px solid var(--cyan);
+            border-radius: 0 8px 8px 0;
+            background: rgba(94, 234, 212, 0.08);
+            color: #dffdfa;
+            line-height: 1.65;
+            font-size: 13px;
+        }
+
+        .status-timeline {
+            position: relative;
+            margin: -2px 0 18px 20px;
+            padding-left: 20px;
+            border-left: 1px solid rgba(94, 234, 212, 0.26);
+        }
+
+        .timeline-entry {
+            position: relative;
+            padding: 0 0 14px;
+        }
+
+        .timeline-entry:last-child {
+            padding-bottom: 0;
+        }
+
+        .timeline-entry::before {
+            content: "";
+            position: absolute;
+            left: -25px;
+            top: 5px;
+            width: 9px;
+            height: 9px;
+            border-radius: 999px;
+            background: var(--cyan);
+            box-shadow: 0 0 12px rgba(94, 234, 212, 0.7);
+        }
+
+        .timeline-entry strong {
+            color: #f7fbff;
+            font-size: 13px;
+        }
+
+        .timeline-entry span {
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+            margin-top: 3px;
+            line-height: 1.55;
+        }
+
         .idea-actions {
             display: flex;
             flex-wrap: wrap;
@@ -899,6 +1265,80 @@ def inject_css() -> None:
         .landing-hero:after {
             content: none;
             pointer-events: none;
+        }
+
+        .weather-atmosphere {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.5s ease;
+        }
+
+        .weather-fog .weather-atmosphere {
+            opacity: 0.78;
+            background:
+                linear-gradient(100deg, transparent 10%, rgba(210, 222, 232, 0.28) 42%, transparent 72%),
+                linear-gradient(80deg, transparent 26%, rgba(255, 255, 255, 0.18) 58%, transparent 86%);
+            animation: weatherDrift 12s ease-in-out infinite alternate;
+        }
+
+        .weather-cloudy .weather-atmosphere {
+            opacity: 0.52;
+            background: linear-gradient(105deg, transparent 24%, rgba(175, 191, 205, 0.28) 55%, transparent 82%);
+            animation: weatherDrift 16s ease-in-out infinite alternate;
+        }
+
+        .weather-light .weather-atmosphere {
+            opacity: 0.28;
+            background: linear-gradient(100deg, transparent 38%, rgba(220, 234, 242, 0.22) 64%, transparent 88%);
+            animation: weatherDrift 18s ease-in-out infinite alternate;
+        }
+
+        .weather-clear .weather-atmosphere {
+            opacity: 0.22;
+            background: linear-gradient(0deg, rgba(94, 234, 212, 0.10), transparent 44%);
+        }
+
+        @keyframes weatherDrift {
+            from { transform: translateX(-3%); }
+            to { transform: translateX(3%); }
+        }
+
+        .landing-weather {
+            position: absolute;
+            top: 32px;
+            right: 36px;
+            z-index: 3;
+            width: min(310px, calc(100vw - 72px));
+            padding: 14px 16px;
+            border: 1px solid rgba(255, 255, 255, 0.20);
+            border-radius: 8px;
+            background: rgba(8, 13, 26, 0.30);
+            backdrop-filter: blur(14px);
+            color: #f7fbff;
+        }
+
+        .landing-weather span,
+        .landing-weather small {
+            display: block;
+            color: #a9bbcc;
+            font-size: 11px;
+        }
+
+        .landing-weather strong {
+            display: block;
+            margin: 4px 0 5px;
+            color: #ffffff;
+            font-size: 19px;
+        }
+
+        .landing-weather p {
+            margin: 0 0 6px;
+            color: #dbe7f3;
+            font-size: 12px;
+            line-height: 1.55;
         }
 
         .landing-content {
@@ -1245,6 +1685,11 @@ def inject_css() -> None:
                 bottom: 7vh;
                 padding: 0 20px;
             }
+            .landing-weather {
+                top: 20px;
+                right: 20px;
+                width: min(280px, calc(100vw - 40px));
+            }
         }
         </style>
         """,
@@ -1274,14 +1719,64 @@ def hide_sidebar_for_landing() -> None:
     )
 
 
+def organization_weather(data: dict) -> dict:
+    ideas = [idea for idea in data["ideas"] if idea.get("status") != "已合并"]
+    active = [idea for idea in ideas if idea.get("status") not in {"已完成", "已合并"}]
+    unanswered = [idea for idea in active if not idea.get("management_response")]
+    high_unanswered = [idea for idea in unanswered if int(idea.get("heat", 0) or 0) >= 70]
+    responded = [idea for idea in ideas if idea.get("management_response")]
+    completed = sum(1 for idea in ideas if idea.get("status") == "已完成") + sum(
+        1 for task in data["tasks"] if task.get("status") == "已完成"
+    )
+    category_counter = Counter(idea.get("category", "综合建议") for idea in active)
+    top_category = category_counter.most_common(1)[0][0] if category_counter else "暂无集中议题"
+    response_rate = round(len(responded) / max(len(ideas), 1) * 100)
+
+    if len(high_unanswered) >= 2:
+        return {
+            "class": "weather-fog",
+            "label": "山间浓雾",
+            "summary": f"{len(high_unanswered)} 条高热反馈仍待回应，建议优先明确负责人。",
+            "meta": f"回应率 {response_rate}% · 关注 {top_category}",
+        }
+    if top_category == "沟通协同" and unanswered:
+        return {
+            "class": "weather-cloudy",
+            "label": "流云偏多",
+            "summary": "沟通协同声音正在聚集，信息需要更早抵达相关人员。",
+            "meta": f"待回应 {len(unanswered)} 条 · 回应率 {response_rate}%",
+        }
+    if completed and response_rate >= 60:
+        return {
+            "class": "weather-clear",
+            "label": "富士晴朗",
+            "summary": f"已有 {completed} 个议题完成闭环，组织回应正在形成稳定节奏。",
+            "meta": f"回应率 {response_rate}% · 已闭环 {completed} 项",
+        }
+    return {
+        "class": "weather-light",
+        "label": "薄云待晴",
+        "summary": "目前没有明显风暴，但仍有声音等待第一次正式回应。",
+        "meta": f"待回应 {len(unanswered)} 条 · 关注 {top_category}",
+    }
+
+
 def render_landing(data: dict) -> None:
     hide_sidebar_for_landing()
     hero_uri = image_data_uri(HERO_IMAGE)
+    weather = organization_weather(data)
 
     st.markdown(
         f"""
         <div class="landing-shell">
-            <section class="landing-hero" style="background-image: url('{hero_uri}');">
+            <section class="landing-hero {weather['class']}" style="background-image: url('{hero_uri}');">
+                <div class="weather-atmosphere"></div>
+                <div class="landing-weather">
+                    <span>富士山组织天气</span>
+                    <strong>{html.escape(weather['label'])}</strong>
+                    <p>{html.escape(weather['summary'])}</p>
+                    <small>{html.escape(weather['meta'])}</small>
+                </div>
                 <div class="landing-content">
                     <div class="landing-title">Stellar</div>
                     <div class="landing-copy">
@@ -1305,10 +1800,6 @@ def render_landing(data: dict) -> None:
                         <form method="get">
                             <input type="hidden" name="view" value="echoes">
                             <button type="submit" class="landing-ghost">回声墙</button>
-                        </form>
-                        <form method="get">
-                            <input type="hidden" name="view" value="postcard">
-                            <button type="submit" class="landing-ghost">管理层明信片</button>
                         </form>
                     </div>
                 </div>
@@ -1391,7 +1882,7 @@ def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool 
                     <button class="{like_class}" type="submit">{like_text}</button>
                 </form>
         """
-        if allow_delete and idea.get("delete_code"):
+        if allow_delete and (idea.get("delete_code_hash") or idea.get("delete_code")):
             action_html += f"""
                 <form method="get">
                     {query_form_fields(view="workspace", page="progress", op="delete", idea=idea_id)}
@@ -1399,6 +1890,17 @@ def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool 
                 </form>
             """
         action_html += "</div>"
+    response_html = ""
+    if idea.get("management_response"):
+        response_html = (
+            '<div class="management-response"><strong>管理层回应</strong><br>'
+            f'{html.escape(idea["management_response"])}'
+            f'<br><span class="muted">负责人：{html.escape(idea.get("owner", "待确认"))}'
+            f' · 下次更新：{html.escape(idea.get("next_update_at", "待定") or "待定")}</span></div>'
+        )
+    merged_html = ""
+    if idea.get("merged_into_id"):
+        merged_html = '<div class="management-response"><strong>已合并到主议题</strong><br>原始反馈仍被保留，后续进展请查看主议题。</div>'
 
     st.html(
         f"""
@@ -1417,14 +1919,85 @@ def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool 
             <span class="tag">赞同 {idea["votes"]}</span>
             <span class="tag">{html.escape(idea["created_at"])}</span>
             <div class="heat-breakdown">{factor_html}</div>
+            {response_html}
+            {merged_html}
             {action_html}
         </div>
         """
     )
 
 
+def render_status_timeline(idea: dict) -> None:
+    history = idea.get("history") or [
+        {
+            "to_status": idea.get("status", "待确认"),
+            "response": "反馈已提交，等待确认。",
+            "owner": idea.get("owner", "待确认"),
+            "actor": "系统",
+            "created_at": idea.get("created_at", ""),
+        }
+    ]
+    entries = []
+    for event in history:
+        status = html.escape(str(event.get("to_status") or "状态更新"))
+        actor = html.escape(str(event.get("actor") or "系统"))
+        created_at = html.escape(str(event.get("created_at") or ""))
+        response = html.escape(str(event.get("response") or ""))
+        owner = html.escape(str(event.get("owner") or ""))
+        detail = response or (f"负责人：{owner}" if owner else "")
+        entries.append(
+            f'<div class="timeline-entry"><strong>{status} · {actor}</strong>'
+            f'<span>{created_at}{(" · " + detail) if detail else ""}</span></div>'
+        )
+    st.html(f'<div class="status-timeline">{"".join(entries)}</div>')
+
+
+def finalize_idea_submission(data: dict, idea: dict) -> None:
+    data["ideas"].insert(0, idea)
+    persist_new_idea(data, idea)
+    st.session_state.pop("pending_similar_submission", None)
+    st.session_state["pending_toast"] = "反馈已提交。"
+    st.query_params["view"] = "workspace"
+    st.query_params["page"] = "progress"
+    st.rerun()
+
+
 def render_submit_form(data: dict) -> None:
     st.markdown('<div class="section-title">填写反馈</div>', unsafe_allow_html=True)
+    pending = st.session_state.get("pending_similar_submission")
+    if pending:
+        candidate = normalize_idea(pending["idea"])
+        match_ids = pending.get("match_ids", [])
+        matches = [idea for idea in data["ideas"] if idea["id"] in match_ids]
+        st.warning("发现可能相似的已有议题。你可以直接支持它，避免同一个问题被分散。")
+        for match in matches:
+            score = round(idea_similarity(candidate, match) * 100)
+            st.html(
+                f'<div class="glass-card"><span class="tag">相似度 {score}%</span>'
+                f'<span class="tag">热度 {match["heat"]}%</span>'
+                f'<div class="idea-title">{html.escape(match["title"])}</div>'
+                f'<p class="muted">{html.escape(match["content"][:180])}</p></div>'
+            )
+            if st.button(f'支持已有议题「{match["title"][:18]}」', key=f'join_{match["id"]}', use_container_width=True):
+                if persist_vote(match, get_session_token(), data):
+                    liked_idea_ids().add(match["id"])
+                    message = "已加入已有议题，并增加一份共鸣。"
+                else:
+                    message = "你已经支持过这个议题。"
+                st.session_state.pop("pending_similar_submission", None)
+                st.session_state["pending_toast"] = message
+                st.query_params["view"] = "workspace"
+                st.query_params["page"] = "progress"
+                st.rerun()
+        left, right = st.columns(2)
+        if left.button("仍然提交为新反馈", type="primary", use_container_width=True):
+            finalize_idea_submission(data, candidate)
+        if right.button("取消本次提交", use_container_width=True):
+            st.session_state.pop("pending_similar_submission", None)
+            st.rerun()
+        st.divider()
+        return
+
     with st.form("idea_form", clear_on_submit=True):
         col1, col2 = st.columns([1.1, 0.9])
         with col1:
@@ -1445,10 +2018,11 @@ def render_submit_form(data: dict) -> None:
             st.warning("删除码必须是4位数字（提交后无法修改，请记住它）。")
             return
         category, _priority, heat = classify_text(f"{title} {content} {impact}")
-        data["ideas"].insert(
-            0,
+        idea_id = f"idea-{uuid4().hex[:8]}"
+        created_at = now_str()
+        new_idea = normalize_idea(
             {
-                "id": f"idea-{uuid4().hex[:8]}",
+                "id": idea_id,
                 "title": title.strip(),
                 "category": category,
                 "author": "匿名" if anonymous else (author.strip() or "未署名同事"),
@@ -1459,15 +2033,28 @@ def render_submit_form(data: dict) -> None:
                 "base_heat": heat,
                 "heat": heat,
                 "votes": 1,
-                "created_at": now_str(),
-                "delete_code": delete_code.strip() or "",
-            },
+                "created_at": created_at,
+                "delete_code_hash": hash_delete_code(delete_code.strip(), idea_id),
+                "history": [
+                    {
+                        "from_status": "",
+                        "to_status": "待确认",
+                        "response": "反馈已提交，等待协同小组确认。",
+                        "owner": "待确认",
+                        "actor": "系统",
+                        "created_at": created_at,
+                    }
+                ],
+            }
         )
-        save_data(data)
-        st.success("已提交！正在跳转到进度页面……")
-        st.query_params["view"] = "workspace"
-        st.query_params["page"] = "progress"
-        st.rerun()
+        similar = find_similar_ideas(new_idea, data["ideas"])
+        if similar:
+            st.session_state["pending_similar_submission"] = {
+                "idea": new_idea,
+                "match_ids": [idea["id"] for idea, _score in similar],
+            }
+            st.rerun()
+        finalize_idea_submission(data, new_idea)
 
 
 def render_ideas(data: dict) -> None:
@@ -1589,6 +2176,7 @@ def render_translator(data: dict) -> None:
             )
 
         if st.button("把转译结果送入查看进度", key="send_translator_result", use_container_width=True):
+            created_at = now_str()
             translated_idea = normalize_idea(
                 {
                     "id": f"idea-{uuid4().hex[:8]}",
@@ -1602,11 +2190,21 @@ def render_translator(data: dict) -> None:
                     "base_heat": preview_idea["heat"],
                     "heat": preview_idea["heat"],
                     "votes": 1,
-                    "created_at": now_str(),
+                    "created_at": created_at,
+                    "history": [
+                        {
+                            "from_status": "",
+                            "to_status": "待确认",
+                            "response": "AI 已协助整理表达，等待协同小组确认。",
+                            "owner": "待确认",
+                            "actor": "系统",
+                            "created_at": created_at,
+                        }
+                    ],
                 }
             )
             data["ideas"].insert(0, translated_idea)
-            save_data(data)
+            persist_new_idea(data, translated_idea)
             st.session_state.pop("translator_result", None)
             st.session_state.pop("translator_raw", None)
             st.session_state.pop("translator_target", None)
@@ -1647,44 +2245,47 @@ def render_tasks(data: dict) -> None:
     st.markdown('<div class="section-title">事项看板</div>', unsafe_allow_html=True)
     st.caption('把“有人提了但没人接”的事情变成有状态、有负责人、有下一步的协作任务。')
 
-    statuses = ["待确认", "已受理", "推进中", "已完成", "暂缓"]
+    statuses = ["待确认", "已受理", "推进中", "已完成", "暂缓", "已合并"]
     cols = st.columns(len(statuses))
     for col, status in zip(cols, statuses):
         count = sum(1 for task in data["tasks"] if task["status"] == status)
         col.metric(status, count)
 
-    with st.expander("创建新事项", expanded=False):
-        with st.form("task_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            name = c1.text_input("事项名称")
-            owner = c2.text_input("负责人", value="待确认")
-            due = c3.date_input("截止日期")
-            next_step = st.text_area("下一步动作")
-            priority = st.selectbox("优先级", ["高", "中", "低"])
-            reward = st.text_input("建议激励", value="纳入试点贡献记录")
-            create = st.form_submit_button("生成事项卡")
-        if create and name.strip():
-            data["tasks"].insert(
-                0,
-                {
-                    "id": f"task-{uuid4().hex[:8]}",
-                    "name": name.strip(),
-                    "owner": owner.strip() or "待确认",
-                    "status": "待确认",
-                    "priority": priority,
-                    "progress": 8,
-                    "due": str(due),
-                    "reward": reward.strip() or "待确认",
-                    "members": ["员工协同小组"],
-                    "next_step": next_step.strip() or "等待负责人确认",
-                },
-            )
-            save_data(data)
-            st.success("事项卡已生成。")
-            st.rerun()
+    if is_admin():
+        with st.expander("创建新事项", expanded=False):
+            with st.form("task_form", clear_on_submit=True):
+                c1, c2, c3 = st.columns(3)
+                name = c1.text_input("事项名称")
+                owner = c2.text_input("负责人", value="待确认")
+                due = c3.date_input("截止日期")
+                next_step = st.text_area("下一步动作")
+                priority = st.selectbox("优先级", ["高", "中", "低"])
+                reward = st.text_input("建议激励", value="纳入试点贡献记录")
+                create = st.form_submit_button("生成事项卡")
+            if create and name.strip():
+                data["tasks"].insert(
+                    0,
+                    {
+                        "id": f"task-{uuid4().hex[:8]}",
+                        "name": name.strip(),
+                        "owner": owner.strip() or "待确认",
+                        "status": "待确认",
+                        "priority": priority,
+                        "progress": 8,
+                        "due": str(due),
+                        "reward": reward.strip() or "待确认",
+                        "members": ["员工协同小组"],
+                        "next_step": next_step.strip() or "等待负责人确认",
+                    },
+                )
+                save_data(data)
+                st.success("事项卡已生成。")
+                st.rerun()
 
     for task in data["tasks"]:
         render_task_card(task)
+        if not is_admin():
+            continue
         plan = task.get("plan", "")
         with st.expander("实施方案" + ("  ✓" if plan else ""), expanded=False):
             new_plan = st.text_area(
@@ -2059,6 +2660,80 @@ def render_submit_feedback(data: dict) -> None:
     render_submit_form(data)
 
 
+def is_admin() -> bool:
+    return bool(st.session_state.get("admin_authenticated"))
+
+
+def render_admin_management(data: dict) -> None:
+    if not is_admin() or not data["ideas"]:
+        return
+    st.markdown('<div class="section-title">管理层处理台</div>', unsafe_allow_html=True)
+    st.caption("更新状态、负责人和正式回应；保存后会进入员工可见的时间线。")
+    idea_options = {f'{idea["title"]} · {idea["status"]}': idea["id"] for idea in data["ideas"]}
+    selected_label = st.selectbox("选择反馈", list(idea_options), key="admin_selected_idea")
+    selected_id = idea_options[selected_label]
+    idea = next(item for item in data["ideas"] if item["id"] == selected_id)
+    statuses = ["待确认", "已受理", "推进中", "已完成", "暂缓"]
+    current_index = statuses.index(idea["status"]) if idea["status"] in statuses else 0
+    with st.form(f'admin_manage_{idea["id"]}'):
+        left, right = st.columns(2)
+        new_status = left.selectbox("状态", statuses, index=current_index)
+        new_owner = right.text_input("负责人", value=idea.get("owner", "待确认"))
+        response = st.text_area(
+            "管理层回应",
+            value=idea.get("management_response", ""),
+            placeholder="说明是否受理、为什么、接下来由谁处理。",
+            height=100,
+        )
+        next_update = st.text_input(
+            "下次更新时间",
+            value=idea.get("next_update_at", ""),
+            placeholder="例如：2026-07-17 或 本周五",
+        )
+        merge_candidates = {
+            "不合并": "",
+            **{
+                f'{candidate["title"]} · {candidate["category"]}': candidate["id"]
+                for candidate in data["ideas"]
+                if candidate["id"] != idea["id"] and not candidate.get("merged_into_id")
+            },
+        }
+        current_merge_label = next(
+            (label for label, value in merge_candidates.items() if value == idea.get("merged_into_id")),
+            "不合并",
+        )
+        merge_into_label = st.selectbox(
+            "合并到主议题（可选）",
+            list(merge_candidates),
+            index=list(merge_candidates).index(current_merge_label),
+        )
+        save_update = st.form_submit_button("发布回应与状态更新", use_container_width=True)
+    if save_update:
+        merge_into_id = merge_candidates[merge_into_label]
+        if merge_into_id:
+            new_status = "已合并"
+        if new_status != idea["status"] and not response.strip():
+            st.error("状态发生变化时，请同时填写一段管理层回应。")
+            return
+        old_status = idea["status"]
+        idea["status"] = new_status
+        idea["owner"] = new_owner.strip() or "待确认"
+        idea["management_response"] = response.strip()
+        idea["next_update_at"] = next_update.strip()
+        idea["merged_into_id"] = merge_into_id
+        event = {
+            "from_status": old_status,
+            "to_status": new_status,
+            "response": response.strip(),
+            "owner": idea["owner"],
+            "actor": get_secret_value("ADMIN_NAME") or "管理层",
+            "created_at": now_str(),
+        }
+        persist_management_update(idea, event, data)
+        st.session_state["pending_toast"] = "管理层回应已发布。"
+        st.rerun()
+
+
 def render_feedback_progress(data: dict) -> None:
     st.markdown('<div class="section-title">查看进度</div>', unsafe_allow_html=True)
     st.caption("这里展示已经提交的反馈和正在推进的事项。")
@@ -2071,10 +2746,9 @@ def render_feedback_progress(data: dict) -> None:
             col1, col2, col3 = st.columns([1, 0.4, 0.4])
             entered = col1.text_input("删除码", max_chars=4, label_visibility="collapsed", placeholder="输入提交时设置的4位删除码")
             if col2.button("确认删除", type="primary"):
-                if entered.strip() == pending_idea.get("delete_code", ""):
-                    data["ideas"] = [i for i in data["ideas"] if i["id"] != pending_id]
+                if verify_delete_code(pending_idea, entered.strip()):
+                    persist_delete_idea(data, pending_id)
                     liked_idea_ids().discard(pending_id)
-                    save_data(data)
                     st.session_state.pop("pending_delete_id", None)
                     st.toast("已删除这条反馈。")
                     st.rerun()
@@ -2088,12 +2762,14 @@ def render_feedback_progress(data: dict) -> None:
     if not data["ideas"]:
         st.info('还没有反馈。可以先到“提交反馈”写下第一条。')
         return
+    render_admin_management(data)
     categories = ["全部"] + sorted({i["category"] for i in data["ideas"]})
     selected = st.segmented_control("反馈类型", categories, default="全部")
     for idea in data["ideas"]:
         if selected != "全部" and idea["category"] != selected:
             continue
         render_idea_card(idea, show_actions=True, allow_delete=True)
+        render_status_timeline(idea)
 
     with st.expander("事项处理进度", expanded=False):
         render_tasks(data)
@@ -2184,7 +2860,7 @@ def build_constellations(ideas: list[dict]) -> list[dict]:
 
 def render_star_page(data: dict) -> None:
     hide_sidebar_for_landing()
-    ideas = data["ideas"]
+    ideas = [idea for idea in data["ideas"] if not idea.get("merged_into_id")]
     hero_uri = image_data_uri(NIGHT_HERO_IMAGE)
 
     star_items = []
@@ -2712,7 +3388,7 @@ def make_echo_text(idea: dict) -> str:
 
 def render_echo_wall(data: dict) -> None:
     hide_sidebar_for_landing()
-    ideas = data["ideas"]
+    ideas = [idea for idea in data["ideas"] if not idea.get("merged_into_id")]
     hero_uri = image_data_uri(NIGHT_HERO_IMAGE)
     positions = [
         (38, 46), (68, 38), (82, 56), (24, 64), (54, 62),
@@ -2968,7 +3644,7 @@ def postcard_summary_line(data: dict) -> str:
 
 def render_management_postcard(data: dict) -> None:
     hide_sidebar_for_landing()
-    ideas = data["ideas"]
+    ideas = [idea for idea in data["ideas"] if not idea.get("merged_into_id")]
     tasks = data["tasks"]
     hero_uri = image_data_uri(HERO_IMAGE)
     hot_ideas = sorted(ideas, key=lambda item: item["heat"], reverse=True)[:3]
@@ -3390,6 +4066,29 @@ def render_settings_panel() -> None:
     st.caption(f"Supabase：{'已配置' if supabase_url and supabase_key else '未配置，当前使用本地 JSON'}")
 
 
+def render_admin_login() -> None:
+    admin_password = get_secret_value("ADMIN_PASSWORD")
+    with st.expander("管理入口", expanded=is_admin()):
+        if is_admin():
+            st.success("管理员模式已开启")
+            if st.button("退出管理员模式", use_container_width=True):
+                st.session_state.pop("admin_authenticated", None)
+                st.rerun()
+            return
+        if not admin_password:
+            st.caption("尚未配置 ADMIN_PASSWORD。")
+            return
+        with st.form("admin_login_form"):
+            entered = st.text_input("管理员密码", type="password")
+            login = st.form_submit_button("进入管理模式", use_container_width=True)
+        if login:
+            if hmac.compare_digest(entered, admin_password):
+                st.session_state["admin_authenticated"] = True
+                st.rerun()
+            else:
+                st.error("管理员密码不正确。")
+
+
 def sidebar(data: dict) -> None:
     with st.sidebar:
         st.markdown("## Stellar")
@@ -3402,24 +4101,44 @@ def sidebar(data: dict) -> None:
         st.metric("想法总数", len(data["ideas"]))
         st.metric("事项总数", len(data["tasks"]))
         st.divider()
-        st.download_button(
-            "下载数据备份",
-            data=json.dumps(data, ensure_ascii=False, indent=2),
-            file_name=f"stellar_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-        uploaded_backup = st.file_uploader("恢复数据备份", type=["json"], label_visibility="collapsed")
-        if uploaded_backup is not None:
-            try:
-                restored = normalize_data(json.loads(uploaded_backup.getvalue().decode("utf-8")))
-                save_data(restored)
-                st.success("数据已恢复。")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"恢复失败：{exc}")
+        st.markdown("**共鸣空间**")
+        if st.button("星空意见图", key="sidebar_stars", use_container_width=True):
+            st.session_state["view"] = "stars"
+            st.query_params.clear()
+            st.query_params["view"] = "stars"
+            st.rerun()
+        if st.button("回声墙", key="sidebar_echoes", use_container_width=True):
+            st.session_state["view"] = "echoes"
+            st.query_params.clear()
+            st.query_params["view"] = "echoes"
+            st.rerun()
         st.divider()
-        render_settings_panel()
+        render_admin_login()
+        if is_admin():
+            if st.button("管理层明信片", key="sidebar_postcard", use_container_width=True):
+                st.session_state["view"] = "postcard"
+                st.query_params.clear()
+                st.query_params["view"] = "postcard"
+                st.rerun()
+            st.divider()
+            st.download_button(
+                "下载数据备份",
+                data=json.dumps(data, ensure_ascii=False, indent=2),
+                file_name=f"stellar_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            uploaded_backup = st.file_uploader("恢复数据备份", type=["json"], label_visibility="collapsed")
+            if uploaded_backup is not None:
+                try:
+                    restored = normalize_data(json.loads(uploaded_backup.getvalue().decode("utf-8")))
+                    save_data(restored)
+                    st.success("数据已恢复。")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"恢复失败：{exc}")
+            st.divider()
+            render_settings_panel()
 
 
 def handle_feedback_actions(data: dict) -> None:
@@ -3437,21 +4156,15 @@ def handle_feedback_actions(data: dict) -> None:
 
     if action == "like":
         token = get_session_token()
-        voters = set(idea.get("voters") or [])
-        if token not in voters:
-            idea["votes"] = max(0, int(idea.get("votes", 0) or 0)) + 1
-            voters.add(token)
-            idea["voters"] = list(voters)
-            refresh_idea_heat_scores(data["ideas"])
+        if persist_vote(idea, token, data):
             liked_idea_ids().add(idea_id)
-            save_data(data)
             st.toast("已赞同，这条反馈的热度已更新。")
         else:
             liked_idea_ids().add(idea_id)
             st.toast("你已经赞同过这条反馈了。")
 
     if action == "delete":
-        if idea.get("delete_code"):
+        if idea.get("delete_code_hash") or idea.get("delete_code"):
             st.session_state["pending_delete_id"] = idea_id
             st.query_params.clear()
             st.query_params["view"] = "workspace"
@@ -3511,23 +4224,20 @@ def main() -> None:
         return
 
     if st.session_state["view"] == "postcard" or st.query_params.get("page") == "postcard":
-        render_management_postcard(data)
-        return
+        if is_admin():
+            render_management_postcard(data)
+            return
+        st.session_state["view"] = "workspace"
+        st.query_params.clear()
+        st.query_params["view"] = "workspace"
+        st.query_params["page"] = "progress"
+        st.session_state["pending_toast"] = "请先从侧边栏进入管理员模式。"
+        st.rerun()
 
     sidebar(data)
     page_param = st.query_params.get("page")
-    default_page = {"progress": "查看进度", "echoes": "回声墙", "postcard": "管理层明信片"}.get(page_param, "提交反馈")
-    page = st.segmented_control("页面", ["提交反馈", "查看进度", "星空意见图", "回声墙", "管理层明信片"], default=default_page)
-    if page == "星空意见图":
-        st.query_params["view"] = "workspace"
-        st.query_params["page"] = "stars"
-        st.rerun()
-    if page == "回声墙":
-        st.query_params["view"] = "echoes"
-        st.rerun()
-    if page == "管理层明信片":
-        st.query_params["view"] = "postcard"
-        st.rerun()
+    default_page = {"progress": "查看进度"}.get(page_param, "提交反馈")
+    page = st.segmented_control("页面", ["提交反馈", "查看进度"], default=default_page)
     render_hero(data)
     if page == "提交反馈":
         render_submit_feedback(data)
