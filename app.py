@@ -1860,20 +1860,24 @@ def render_landing(data: dict) -> None:
     st.markdown(
         f"""
         <style>
-        .landing-language {{ position:absolute; left:28px; top:24px; z-index:20; display:flex; gap:6px; }}
+        .landing-weather-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; }}
+        .landing-language {{ display:flex; gap:4px; flex:0 0 auto; }}
         .landing-language form {{ margin:0; }}
-        .landing-language button {{ border:1px solid rgba(255,255,255,.22); background:rgba(8,13,26,.28); color:#e8eef8; padding:7px 12px; border-radius:999px; backdrop-filter:blur(10px); cursor:pointer; }}
-        .landing-language button.active {{ color:#5eead4; border-color:rgba(94,234,212,.55); background:rgba(94,234,212,.12); }}
+        .landing-language button {{ border:0; background:transparent; color:#a9bbcc; padding:3px 6px; border-radius:4px; font-size:10px; line-height:1.2; cursor:pointer; }}
+        .landing-language button:hover {{ color:#ffffff; background:rgba(255,255,255,.08); }}
+        .landing-language button.active {{ color:#5eead4; background:rgba(94,234,212,.10); }}
         </style>
         <div class="landing-shell">
             <section class="landing-hero {weather['class']}" style="background-image: url('{hero_uri}');">
-                <div class="landing-language">
-                    <form method="get"><input type="hidden" name="lang" value="zh"><button class="{'active' if current_language() == 'zh' else ''}" type="submit">中文</button></form>
-                    <form method="get"><input type="hidden" name="lang" value="ja"><button class="{'active' if current_language() == 'ja' else ''}" type="submit">日本語</button></form>
-                </div>
                 <div class="weather-atmosphere"></div>
                 <div class="landing-weather">
-                    <span>{tx("富士山组织天气", "富士山 組織の天気")}</span>
+                    <div class="landing-weather-head">
+                        <span>{tx("富士山组织天气", "富士山 組織の天気")}</span>
+                        <div class="landing-language">
+                            <form method="get"><input type="hidden" name="lang" value="zh"><button class="{'active' if current_language() == 'zh' else ''}" type="submit">中文</button></form>
+                            <form method="get"><input type="hidden" name="lang" value="ja"><button class="{'active' if current_language() == 'ja' else ''}" type="submit">日本語</button></form>
+                        </div>
+                    </div>
                     <strong>{html.escape(weather['label'])}</strong>
                     <p>{html.escape(weather['summary'])}</p>
                     <small>{html.escape(weather['meta'])}</small>
@@ -4233,12 +4237,6 @@ def sidebar(data: dict) -> None:
     with st.sidebar:
         st.markdown("## Stellar")
         st.caption(tx("反馈收集 · 进度公开", "声の収集 · 進捗の公開"))
-        language_label = "日本語" if current_language() == "ja" else "中文"
-        st.session_state.setdefault("language_switch", language_label)
-        selected_language = st.segmented_control("Language", list(LANGUAGE_OPTIONS), key="language_switch")
-        if LANGUAGE_OPTIONS[selected_language] != current_language():
-            sync_language_from_widget("language_switch")
-            st.rerun()
         if st.button(tx("返回入口页", "トップへ戻る"), use_container_width=True):
             st.session_state["view"] = "landing"
             st.query_params.clear()
@@ -4289,6 +4287,19 @@ def sidebar(data: dict) -> None:
                     st.error(f"恢复失败：{exc}")
             st.divider()
             render_settings_panel()
+        st.divider()
+        st.caption("语言 / Language")
+        language_label = "日本語" if current_language() == "ja" else "中文"
+        st.session_state.setdefault("language_switch", language_label)
+        selected_language = st.segmented_control(
+            "Language",
+            list(LANGUAGE_OPTIONS),
+            key="language_switch",
+            label_visibility="collapsed",
+        )
+        if LANGUAGE_OPTIONS[selected_language] != current_language():
+            sync_language_from_widget("language_switch")
+            st.rerun()
 
 
 def handle_feedback_actions(data: dict) -> None:
