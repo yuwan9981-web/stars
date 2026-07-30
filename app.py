@@ -33,6 +33,67 @@ LEGACY_GEMINI_MODELS = {"gemini-3.5-flash"}
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEEPSEEK_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3-flash-preview"]
+LANGUAGE_OPTIONS = {"中文": "zh", "日本語": "ja"}
+
+
+UI_VALUE_JA = {
+    "沟通协同": "コミュニケーション・連携",
+    "权益激励": "待遇・インセンティブ",
+    "流程规范": "プロセス整備",
+    "文化活动": "文化・イベント",
+    "成长发展": "成長・キャリア",
+    "综合建议": "総合提案",
+    "待确认": "確認待ち",
+    "已受理": "受付済み",
+    "推进中": "進行中",
+    "已完成": "完了",
+    "暂缓": "保留",
+    "已合并": "統合済み",
+    "高": "高",
+    "中": "中",
+    "低": "低",
+    "匿名": "匿名",
+    "系统": "システム",
+    "系统迁移": "システム移行",
+    "管理层": "管理層",
+    "待定": "未定",
+}
+
+UI_SYSTEM_TEXT_JA = {
+    "反馈已从旧数据迁移。": "旧データから声を移行しました。",
+    "反馈已提交，等待确认。": "声を受け付けました。確認をお待ちください。",
+    "反馈已提交，等待协同小组确认。": "声を受け付けました。連携チームの確認をお待ちください。",
+    "AI 已协助整理表达，等待协同小组确认。": "AIが表現を整えました。連携チームの確認をお待ちください。",
+}
+
+
+def current_language() -> str:
+    return str(st.session_state.get("language", "zh"))
+
+
+def tx(zh: str, ja: str) -> str:
+    return ja if current_language() == "ja" else zh
+
+
+def ui_value(value: object) -> str:
+    text = str(value)
+    return UI_VALUE_JA.get(text, text) if current_language() == "ja" else text
+
+
+def ui_system_text(value: object) -> str:
+    text = str(value)
+    return UI_SYSTEM_TEXT_JA.get(text, text) if current_language() == "ja" else text
+
+
+def language_query_field() -> str:
+    return f'<input type="hidden" name="lang" value="{current_language()}">'
+
+
+def sync_language_from_widget(widget_key: str) -> None:
+    selected = str(st.session_state.get(widget_key, "中文"))
+    code = LANGUAGE_OPTIONS.get(selected, "zh")
+    st.session_state["language"] = code
+    st.query_params["lang"] = code
 
 
 DEFAULT_DATA = {
@@ -700,8 +761,10 @@ def call_gemini_translation(text: str, target: str, model: str, api_key: str) ->
 
 
 def build_translation_prompt(text: str, target: str) -> str:
+    output_language = tx("简体中文", "日本語")
     return f"""
 把员工反馈转成公司内部可执行建议。只输出 JSON，不要 Markdown。
+除 category 和 priority 的枚举值外，其他文本字段使用{output_language}。
 字段：
 category 从 ["沟通协同","权益激励","流程规范","文化活动","成长发展","综合建议"] 选一项；
 priority 从 ["高","中","低"] 选一项；
@@ -724,10 +787,10 @@ def normalize_ai_result(output_text: str, text: str, source: str) -> dict:
         "category": category,
         "priority": priority,
         "heat": max(0, min(100, heat)),
-        "tone": parsed.get("tone") or "正式、克制、聚焦行动",
-        "title": parsed.get("title") or f"{category}优化建议",
+        "tone": parsed.get("tone") or tx("正式、克制、聚焦行动", "丁寧で節度があり、行動に焦点を当てる"),
+        "title": parsed.get("title") or tx(f"{category}优化建议", f"{ui_value(category)}の改善提案"),
         "translated": parsed.get("translated") or polish_text(text),
-        "next_step": parsed.get("next_step") or "先整理共性样本，再确认负责人和反馈周期。",
+        "next_step": parsed.get("next_step") or tx("先整理共性样本，再确认负责人和反馈周期。", "まず共通する事例を整理し、担当者と回答サイクルを決めます。"),
         "source": source,
     }
 
@@ -790,6 +853,25 @@ def translate_emotion(text: str, target: str) -> dict:
         "成长发展": "明确培训、晋升或成长反馈机制，并设置固定沟通周期。",
     }
     core_action = action_map.get(category, "先收集更多样本，再形成可执行事项和反馈节奏。")
+    if current_language() == "ja":
+        action_map_ja = {
+            "沟通协同": "情報共有の窓口を統一し、担当者、更新日、回答の節目を明確にします。",
+            "权益激励": "通常業務外の公共的な仕事に対する手当、代休、貢献記録を明確にします。",
+            "流程规范": "発起、承認、実行、振り返りを明確な手順に整理します。",
+            "文化活动": "投票、担当希望、予算確認、振り返りを含む共創プロセスにします。",
+            "成长发展": "研修、昇進、成長フィードバックの仕組みと定期的な対話を設けます。",
+        }
+        core_action = action_map_ja.get(category, "まず事例を集め、実行可能な案件と回答のリズムを整えます。")
+        return {
+            "category": category,
+            "priority": priority,
+            "heat": heat,
+            "tone": "丁寧で具体的、行動に焦点を当てた表現",
+            "translated": f"「{topic_hint}」に関する声から、{ui_value(category)}に改善の余地があることが分かります。{core_action}対応中の進捗と結果も共有し、課題が口頭のまま残らないようにします。",
+            "title": f"{ui_value(category)}の改善提案：{topic_hint}",
+            "next_step": core_action,
+            "source": "ローカルルール",
+        }
     translated = (
         f'当前围绕"{topic_hint}"的反馈，反映出公司在{category}方面存在可优化空间。'
         f"建议将其作为{priority}优先级事项处理：{core_action}"
@@ -1704,6 +1786,9 @@ def hide_sidebar_for_landing() -> None:
         [data-testid="stSidebar"] {
             display: none;
         }
+        [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"], header {
+            display: none !important;
+        }
         html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
             height: 100dvh;
             overflow: hidden;
@@ -1735,29 +1820,35 @@ def organization_weather(data: dict) -> dict:
     if len(high_unanswered) >= 2:
         return {
             "class": "weather-fog",
-            "label": "山间浓雾",
-            "summary": f"{len(high_unanswered)} 条高热反馈仍待回应，建议优先明确负责人。",
-            "meta": f"回应率 {response_rate}% · 关注 {top_category}",
+            "label": tx("山间浓雾", "山間に濃霧"),
+            "summary": tx(
+                f"{len(high_unanswered)} 条高热反馈仍待回应，建议优先明确负责人。",
+                f"注目度の高い{len(high_unanswered)}件が未回答です。まず担当者を明確にしましょう。",
+            ),
+            "meta": tx(
+                f"回应率 {response_rate}% · 关注 {top_category}",
+                f"回答率 {response_rate}% · 注目 {ui_value(top_category)}",
+            ),
         }
     if top_category == "沟通协同" and unanswered:
         return {
             "class": "weather-cloudy",
-            "label": "流云偏多",
-            "summary": "沟通协同声音正在聚集，信息需要更早抵达相关人员。",
-            "meta": f"待回应 {len(unanswered)} 条 · 回应率 {response_rate}%",
+            "label": tx("流云偏多", "流れ雲多め"),
+            "summary": tx("沟通协同声音正在聚集，信息需要更早抵达相关人员。", "連携に関する声が集まっています。必要な人へより早く情報を届けましょう。"),
+            "meta": tx(f"待回应 {len(unanswered)} 条 · 回应率 {response_rate}%", f"未回答 {len(unanswered)}件 · 回答率 {response_rate}%"),
         }
     if completed and response_rate >= 60:
         return {
             "class": "weather-clear",
-            "label": "富士晴朗",
-            "summary": f"已有 {completed} 个议题完成闭环，组织回应正在形成稳定节奏。",
-            "meta": f"回应率 {response_rate}% · 已闭环 {completed} 项",
+            "label": tx("富士晴朗", "富士快晴"),
+            "summary": tx(f"已有 {completed} 个议题完成闭环，组织回应正在形成稳定节奏。", f"{completed}件の課題が完了し、組織の回答リズムが整いつつあります。"),
+            "meta": tx(f"回应率 {response_rate}% · 已闭环 {completed} 项", f"回答率 {response_rate}% · 完了 {completed}件"),
         }
     return {
         "class": "weather-light",
-        "label": "薄云待晴",
-        "summary": "目前没有明显风暴，但仍有声音等待第一次正式回应。",
-        "meta": f"待回应 {len(unanswered)} 条 · 关注 {top_category}",
+        "label": tx("薄云待晴", "薄曇り、晴れ待ち"),
+        "summary": tx("目前没有明显风暴，但仍有声音等待第一次正式回应。", "大きな嵐はありませんが、まだ最初の正式回答を待つ声があります。"),
+        "meta": tx(f"待回应 {len(unanswered)} 条 · 关注 {top_category}", f"未回答 {len(unanswered)}件 · 注目 {ui_value(top_category)}"),
     }
 
 
@@ -1768,11 +1859,21 @@ def render_landing(data: dict) -> None:
 
     st.markdown(
         f"""
+        <style>
+        .landing-language {{ position:absolute; left:28px; top:24px; z-index:20; display:flex; gap:6px; }}
+        .landing-language form {{ margin:0; }}
+        .landing-language button {{ border:1px solid rgba(255,255,255,.22); background:rgba(8,13,26,.28); color:#e8eef8; padding:7px 12px; border-radius:999px; backdrop-filter:blur(10px); cursor:pointer; }}
+        .landing-language button.active {{ color:#5eead4; border-color:rgba(94,234,212,.55); background:rgba(94,234,212,.12); }}
+        </style>
         <div class="landing-shell">
             <section class="landing-hero {weather['class']}" style="background-image: url('{hero_uri}');">
+                <div class="landing-language">
+                    <form method="get"><input type="hidden" name="lang" value="zh"><button class="{'active' if current_language() == 'zh' else ''}" type="submit">中文</button></form>
+                    <form method="get"><input type="hidden" name="lang" value="ja"><button class="{'active' if current_language() == 'ja' else ''}" type="submit">日本語</button></form>
+                </div>
                 <div class="weather-atmosphere"></div>
                 <div class="landing-weather">
-                    <span>富士山组织天气</span>
+                    <span>{tx("富士山组织天气", "富士山 組織の天気")}</span>
                     <strong>{html.escape(weather['label'])}</strong>
                     <p>{html.escape(weather['summary'])}</p>
                     <small>{html.escape(weather['meta'])}</small>
@@ -1780,26 +1881,30 @@ def render_landing(data: dict) -> None:
                 <div class="landing-content">
                     <div class="landing-title">Stellar</div>
                     <div class="landing-copy">
-                        让每一个想法被看见，让每一次反馈有回声。
+                        {tx("让每一个想法被看见，让每一次反馈有回声。", "すべての想いを見える形に。すべての声に、応答を。")}
                     </div>
                     <div class="landing-actions">
                         <form method="get">
                             <input type="hidden" name="view" value="workspace">
                             <input type="hidden" name="page" value="submit">
-                            <button type="submit" class="landing-cta">提交反馈</button>
+                            {language_query_field()}
+                            <button type="submit" class="landing-cta">{tx("提交反馈", "声を届ける")}</button>
                         </form>
                         <form method="get">
                             <input type="hidden" name="view" value="workspace">
                             <input type="hidden" name="page" value="progress">
-                            <button type="submit" class="landing-ghost">查看进度</button>
+                            {language_query_field()}
+                            <button type="submit" class="landing-ghost">{tx("查看进度", "進捗を見る")}</button>
                         </form>
                         <form method="get">
                             <input type="hidden" name="view" value="stars">
-                            <button type="submit" class="landing-ghost">星空意见图</button>
+                            {language_query_field()}
+                            <button type="submit" class="landing-ghost">{tx("星空意见图", "星空ボイスマップ")}</button>
                         </form>
                         <form method="get">
                             <input type="hidden" name="view" value="echoes">
-                            <button type="submit" class="landing-ghost">回声墙</button>
+                            {language_query_field()}
+                            <button type="submit" class="landing-ghost">{tx("回声墙", "エコーウォール")}</button>
                         </form>
                     </div>
                 </div>
@@ -1822,25 +1927,27 @@ def render_hero(data: dict) -> None:
         f"""
         <div class="hero">
             <h1><span class="pulse-dot"></span>{APP_TITLE}</h1>
-            <p>统一提交反馈，公开查看进度。让问题有人看见，也有机会被跟进。</p>
+            <p>{tx("统一提交反馈，公开查看进度。让问题有人看见，也有机会被跟进。", "声をひとつの場所に集め、進捗を公開。課題を見える形にし、次の行動へつなげます。")}</p>
         </div>
         <div class="metric-grid">
-            <div class="metric-card"><div class="label">反馈数量</div><div class="value">{len(ideas)}</div><div class="hint">已提交的员工反馈</div></div>
-            <div class="metric-card"><div class="label">处理中事项</div><div class="value">{open_tasks}</div><div class="hint">待确认、已受理或推进中</div></div>
-            <div class="metric-card"><div class="label">平均热度</div><div class="value">{avg_heat}%</div><div class="hint">影响、紧急、共鸣、重复、可执行</div></div>
-            <div class="metric-card"><div class="label">反馈类型</div><div class="value">{categories}</div><div class="hint">自动分类统计</div></div>
+            <div class="metric-card"><div class="label">{tx("反馈数量", "声の数")}</div><div class="value">{len(ideas)}</div><div class="hint">{tx("已提交的员工反馈", "届けられたフィードバック")}</div></div>
+            <div class="metric-card"><div class="label">{tx("处理中事项", "対応中の案件")}</div><div class="value">{open_tasks}</div><div class="hint">{tx("待确认、已受理或推进中", "確認待ち・受付済み・進行中")}</div></div>
+            <div class="metric-card"><div class="label">{tx("平均热度", "平均注目度")}</div><div class="value">{avg_heat}%</div><div class="hint">{tx("影响、紧急、共鸣、重复、可执行", "影響・緊急性・共感・重複・実行性")}</div></div>
+            <div class="metric-card"><div class="label">{tx("反馈类型", "カテゴリ")}</div><div class="value">{categories}</div><div class="hint">{tx("自动分类统计", "自動分類の集計")}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
     if completed:
-        st.toast(f"已有 {completed} 个事项完成闭环")
+        st.toast(tx(f"已有 {completed} 个事项完成闭环", f"{completed}件の案件が完了しました"))
 
 
 def query_form_fields(**params: str) -> str:
+    fields = dict(params)
+    fields.setdefault("lang", current_language())
     return "\n".join(
         f'<input type="hidden" name="{html.escape(str(key))}" value="{html.escape(str(value), quote=True)}">'
-        for key, value in params.items()
+        for key, value in fields.items()
     )
 
 
@@ -1863,16 +1970,16 @@ def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool 
     factor_html = "".join(
         f'<span class="tag">{label} {int(factors.get(key, 0))}</span>'
         for key, label in [
-            ("impact", "影响"),
-            ("urgency", "紧急"),
-            ("resonance", "共鸣"),
-            ("duplication", "重复"),
-            ("actionability", "可执行"),
+            ("impact", tx("影响", "影響")),
+            ("urgency", tx("紧急", "緊急性")),
+            ("resonance", tx("共鸣", "共感")),
+            ("duplication", tx("重复", "重複")),
+            ("actionability", tx("可执行", "実行性")),
         ]
     )
     is_liked = idea_id in liked_idea_ids()
     like_class = "idea-action-button is-liked" if is_liked else "idea-action-button"
-    like_text = "已赞同" if is_liked else "赞同这个反馈"
+    like_text = tx("已赞同", "共感済み") if is_liked else tx("赞同这个反馈", "この声に共感")
     action_html = ""
     if show_actions:
         action_html = f"""
@@ -1886,21 +1993,21 @@ def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool 
             action_html += f"""
                 <form method="get">
                     {query_form_fields(view="workspace", page="progress", op="delete", idea=idea_id)}
-                    <button class="idea-delete-button" type="submit">删除反馈</button>
+                    <button class="idea-delete-button" type="submit">{tx("删除反馈", "削除")}</button>
                 </form>
             """
         action_html += "</div>"
     response_html = ""
     if idea.get("management_response"):
         response_html = (
-            '<div class="management-response"><strong>管理层回应</strong><br>'
+            f'<div class="management-response"><strong>{tx("管理层回应", "管理層からの回答")}</strong><br>'
             f'{html.escape(idea["management_response"])}'
-            f'<br><span class="muted">负责人：{html.escape(idea.get("owner", "待确认"))}'
-            f' · 下次更新：{html.escape(idea.get("next_update_at", "待定") or "待定")}</span></div>'
+            f'<br><span class="muted">{tx("负责人", "担当者")}：{html.escape(ui_value(idea.get("owner", "待确认")))}'
+            f' · {tx("下次更新", "次回更新")}：{html.escape(ui_value(idea.get("next_update_at", "待定") or "待定"))}</span></div>'
         )
     merged_html = ""
     if idea.get("merged_into_id"):
-        merged_html = '<div class="management-response"><strong>已合并到主议题</strong><br>原始反馈仍被保留，后续进展请查看主议题。</div>'
+        merged_html = f'<div class="management-response"><strong>{tx("已合并到主议题", "主要テーマに統合済み")}</strong><br>{tx("原始反馈仍被保留，后续进展请查看主议题。", "元の声は保存されています。今後の進捗は主要テーマをご覧ください。")}</div>'
 
     st.html(
         f"""
@@ -1908,15 +2015,15 @@ def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool 
             <div class="idea-head">
                 <div>
                     <div class="idea-title">{html.escape(idea["title"])}</div>
-                    <span class="tag">{html.escape(idea["category"])}</span>
-                    <span class="tag" style="border-color:{color}; color:{color};">{idea["status"]}</span>
-                    <span class="tag">来自：{html.escape(idea["author"])}</span>
+                    <span class="tag">{html.escape(ui_value(idea["category"]))}</span>
+                    <span class="tag" style="border-color:{color}; color:{color};">{html.escape(ui_value(idea["status"]))}</span>
+                    <span class="tag">{tx("来自", "投稿者")}：{html.escape(ui_value(idea["author"]))}</span>
                 </div>
-                <div class="heat">{idea["heat"]}%<br><span style="font-size:11px;color:#dbeafe;">热度</span></div>
+                <div class="heat">{idea["heat"]}%<br><span style="font-size:11px;color:#dbeafe;">{tx("热度", "注目度")}</span></div>
             </div>
             <p>{html.escape(idea["content"])}</p>
-            <p class="muted">预期影响：{html.escape(idea["impact"])}</p>
-            <span class="tag">赞同 {idea["votes"]}</span>
+            <p class="muted">{tx("希望如何改进", "期待する改善")}：{html.escape(idea["impact"])}</p>
+            <span class="tag">{tx("赞同", "共感")} {idea["votes"]}</span>
             <span class="tag">{html.escape(idea["created_at"])}</span>
             <div class="heat-breakdown">{factor_html}</div>
             {response_html}
@@ -1939,12 +2046,12 @@ def render_status_timeline(idea: dict) -> None:
     ]
     entries = []
     for event in history:
-        status = html.escape(str(event.get("to_status") or "状态更新"))
-        actor = html.escape(str(event.get("actor") or "系统"))
+        status = html.escape(ui_value(event.get("to_status") or tx("状态更新", "ステータス更新")))
+        actor = html.escape(ui_value(event.get("actor") or "系统"))
         created_at = html.escape(str(event.get("created_at") or ""))
-        response = html.escape(str(event.get("response") or ""))
+        response = html.escape(ui_system_text(event.get("response") or ""))
         owner = html.escape(str(event.get("owner") or ""))
-        detail = response or (f"负责人：{owner}" if owner else "")
+        detail = response or (f'{tx("负责人", "担当者")}：{owner}' if owner else "")
         entries.append(
             f'<div class="timeline-entry"><strong>{status} · {actor}</strong>'
             f'<span>{created_at}{(" · " + detail) if detail else ""}</span></div>'
@@ -1956,43 +2063,43 @@ def finalize_idea_submission(data: dict, idea: dict) -> None:
     data["ideas"].insert(0, idea)
     persist_new_idea(data, idea)
     st.session_state.pop("pending_similar_submission", None)
-    st.session_state["pending_toast"] = "反馈已提交。"
+    st.session_state["pending_toast"] = tx("反馈已提交。", "声を受け付けました。")
     st.query_params["view"] = "workspace"
     st.query_params["page"] = "progress"
     st.rerun()
 
 
 def render_submit_form(data: dict) -> None:
-    st.markdown('<div class="section-title">填写反馈</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title">{tx("填写反馈", "声を書く")}</div>', unsafe_allow_html=True)
     pending = st.session_state.get("pending_similar_submission")
     if pending:
         candidate = normalize_idea(pending["idea"])
         match_ids = pending.get("match_ids", [])
         matches = [idea for idea in data["ideas"] if idea["id"] in match_ids]
-        st.warning("发现可能相似的已有议题。你可以直接支持它，避免同一个问题被分散。")
+        st.warning(tx("发现可能相似的已有议题。你可以直接支持它，避免同一个问题被分散。", "似た内容のテーマがあります。新規投稿の代わりに共感を送ることもできます。"))
         for match in matches:
             score = round(idea_similarity(candidate, match) * 100)
             st.html(
-                f'<div class="glass-card"><span class="tag">相似度 {score}%</span>'
-                f'<span class="tag">热度 {match["heat"]}%</span>'
+                f'<div class="glass-card"><span class="tag">{tx("相似度", "類似度")} {score}%</span>'
+                f'<span class="tag">{tx("热度", "注目度")} {match["heat"]}%</span>'
                 f'<div class="idea-title">{html.escape(match["title"])}</div>'
                 f'<p class="muted">{html.escape(match["content"][:180])}</p></div>'
             )
-            if st.button(f'支持已有议题「{match["title"][:18]}」', key=f'join_{match["id"]}', use_container_width=True):
+            if st.button(tx(f'支持已有议题「{match["title"][:18]}」', f'「{match["title"][:18]}」に共感する'), key=f'join_{match["id"]}', use_container_width=True):
                 if persist_vote(match, get_session_token(), data):
                     liked_idea_ids().add(match["id"])
-                    message = "已加入已有议题，并增加一份共鸣。"
+                    message = tx("已加入已有议题，并增加一份共鸣。", "既存テーマに共感を送りました。")
                 else:
-                    message = "你已经支持过这个议题。"
+                    message = tx("你已经支持过这个议题。", "このテーマには共感済みです。")
                 st.session_state.pop("pending_similar_submission", None)
                 st.session_state["pending_toast"] = message
                 st.query_params["view"] = "workspace"
                 st.query_params["page"] = "progress"
                 st.rerun()
         left, right = st.columns(2)
-        if left.button("仍然提交为新反馈", type="primary", use_container_width=True):
+        if left.button(tx("仍然提交为新反馈", "新しい声として投稿"), type="primary", use_container_width=True):
             finalize_idea_submission(data, candidate)
-        if right.button("取消本次提交", use_container_width=True):
+        if right.button(tx("取消本次提交", "キャンセル"), use_container_width=True):
             st.session_state.pop("pending_similar_submission", None)
             st.rerun()
         st.divider()
@@ -2001,21 +2108,21 @@ def render_submit_form(data: dict) -> None:
     with st.form("idea_form", clear_on_submit=True):
         col1, col2 = st.columns([1.1, 0.9])
         with col1:
-            title = st.text_input("标题", placeholder="例如：希望建立固定的信息同步机制")
-            content = st.text_area("反馈内容", placeholder="描述发生了什么、影响了谁、为什么值得处理")
-            impact = st.text_area("希望如何改进", placeholder="写下你期待的处理方式或建议")
+            title = st.text_input(tx("标题", "タイトル"), placeholder=tx("例如：希望建立固定的信息同步机制", "例：定期的な情報共有の仕組みがほしい"))
+            content = st.text_area(tx("反馈内容", "内容"), placeholder=tx("描述发生了什么、影响了谁、为什么值得处理", "何が起きたか、誰に影響したか、なぜ改善したいかを書いてください"))
+            impact = st.text_area(tx("希望如何改进", "期待する改善"), placeholder=tx("写下你期待的处理方式或建议", "期待する対応や提案を書いてください"))
         with col2:
-            author = st.text_input("署名", placeholder="可填写昵称")
-            anonymous = st.toggle("匿名提交", value=True)
-            delete_code = st.text_input("删除码（4位数字，记住它才能删除自己的反馈）*", max_chars=4, placeholder="如：1234")
-            submitted = st.form_submit_button("提交反馈")
+            author = st.text_input(tx("署名", "お名前"), placeholder=tx("可填写昵称", "ニックネームでも可"))
+            anonymous = st.toggle(tx("匿名提交", "匿名で投稿"), value=True)
+            delete_code = st.text_input(tx("删除码（4位数字，记住它才能删除自己的反馈）*", "削除コード（4桁の数字、投稿の削除に必要）*"), max_chars=4, placeholder=tx("如：1234", "例：1234"))
+            submitted = st.form_submit_button(tx("提交反馈", "声を届ける"))
 
     if submitted:
         if not title.strip() or not content.strip():
-            st.warning("标题和问题描述需要先写一下。")
+            st.warning(tx("标题和问题描述需要先写一下。", "タイトルと内容を入力してください。"))
             return
         if not delete_code.strip() or not delete_code.strip().isdigit() or len(delete_code.strip()) != 4:
-            st.warning("删除码必须是4位数字（提交后无法修改，请记住它）。")
+            st.warning(tx("删除码必须是4位数字（提交后无法修改，请记住它）。", "削除コードは4桁の数字で入力してください。投稿後は変更できません。"))
             return
         category, _priority, heat = classify_text(f"{title} {content} {impact}")
         idea_id = f"idea-{uuid4().hex[:8]}"
@@ -2069,8 +2176,8 @@ def render_ideas(data: dict) -> None:
 
 
 def render_translator(data: dict) -> None:
-    st.markdown('<div class="section-title">AI 整理表达</div>', unsafe_allow_html=True)
-    st.caption("把原始想法整理成更清楚、可处理的反馈。")
+    st.markdown(f'<div class="section-title">{tx("AI 整理表达", "AIで表現を整える")}</div>', unsafe_allow_html=True)
+    st.caption(tx("把原始想法整理成更清楚、可处理的反馈。", "そのままの思いを、明確で対応しやすい表現に整えます。"))
     deepseek_key, deepseek_default = get_deepseek_config()
     gemini_key, gemini_default = get_gemini_config()
 
@@ -2078,18 +2185,18 @@ def render_translator(data: dict) -> None:
 
     with st.form("translator_form"):
         raw = st.text_area(
-            "想说的话",
+            tx("想说的话", "伝えたいこと"),
             value="",
             height=130,
-            placeholder="直接写真实想法即可，例如：部门之间信息不同步，经常不知道事情推进到哪里。",
+            placeholder=tx("直接写真实想法即可，例如：部门之间信息不同步，经常不知道事情推进到哪里。", "そのままの言葉で大丈夫です。例：部門間の情報共有が遅く、仕事がどこまで進んでいるか分からない。"),
         )
         target = st.radio(
-            "整理用途",
+            tx("整理用途", "宛先"),
             ["给管理层", "给协同负责人", "给活动负责人"],
             horizontal=True,
         )
         provider = st.selectbox(
-            "AI 服务",
+            tx("AI 服务", "AIサービス"),
             provider_options,
             index=0 if deepseek_key else 2,
             help=f"DeepSeek：{'已配置' if deepseek_key else '未配置'}；Gemini：{'已配置' if gemini_key else '未配置'}",
@@ -2102,11 +2209,11 @@ def render_translator(data: dict) -> None:
             model = st.selectbox("模型", GEMINI_MODELS, index=default_index)
         else:
             model = "local"
-        submitted = st.form_submit_button("整理表达")
+        submitted = st.form_submit_button(tx("整理表达", "表現を整える"))
 
     if submitted:
         if not raw.strip():
-            st.warning("先写一点想反馈的内容。")
+            st.warning(tx("先写一点想反馈的内容。", "まず伝えたいことを書いてください。"))
             return
         if provider in {"DeepSeek", "Gemini"}:
             with st.spinner(f"{provider} 正在整理..."):
@@ -2217,39 +2324,39 @@ def render_translator(data: dict) -> None:
 def render_task_card(task: dict) -> None:
     color = status_color(task["status"])
     members = html.escape(" / ".join(task["members"]))
-    plan_html = f'<p class="muted">实施方案：{html.escape(task["plan"])}</p>' if task.get("plan") else ""
+    plan_html = f'<p class="muted">{tx("实施方案", "実施計画")}：{html.escape(task["plan"])}</p>' if task.get("plan") else ""
     st.html(
         f"""
         <div class="task-card">
             <div class="idea-head">
                 <div>
                     <div class="idea-title">{html.escape(task["name"])}</div>
-                    <span class="tag" style="border-color:{color}; color:{color};">{html.escape(task["status"])}</span>
-                    <span class="tag">优先级：{html.escape(task["priority"])}</span>
-                    <span class="tag">截止：{html.escape(str(task["due"]))}</span>
+                    <span class="tag" style="border-color:{color}; color:{color};">{html.escape(ui_value(task["status"]))}</span>
+                    <span class="tag">{tx("优先级", "優先度")}：{html.escape(ui_value(task["priority"]))}</span>
+                    <span class="tag">{tx("截止", "期限")}：{html.escape(ui_value(task["due"]))}</span>
                 </div>
-                <div class="heat">{task["progress"]}%<br><span style="font-size:11px;color:#dbeafe;">进度</span></div>
+                <div class="heat">{task["progress"]}%<br><span style="font-size:11px;color:#dbeafe;">{tx("进度", "進捗")}</span></div>
             </div>
             <div class="progress-shell"><div class="progress-bar" style="width:{task["progress"]}%;"></div></div>
-            <p>负责人：{html.escape(task["owner"])}</p>
-            <p class="muted">参与方：{members}</p>
-            <p class="muted">下一步：{html.escape(task["next_step"])}</p>
+            <p>{tx("负责人", "担当者")}：{html.escape(ui_value(task["owner"]))}</p>
+            <p class="muted">{tx("参与方", "参加者")}：{members}</p>
+            <p class="muted">{tx("下一步", "次のアクション")}：{html.escape(task["next_step"])}</p>
             {plan_html}
-            <span class="tag">激励：{html.escape(task["reward"])}</span>
+            <span class="tag">{tx("激励", "インセンティブ")}：{html.escape(task["reward"])}</span>
         </div>
         """
     )
 
 
 def render_tasks(data: dict) -> None:
-    st.markdown('<div class="section-title">事项看板</div>', unsafe_allow_html=True)
-    st.caption('把“有人提了但没人接”的事情变成有状态、有负责人、有下一步的协作任务。')
+    st.markdown(f'<div class="section-title">{tx("事项看板", "案件ボード")}</div>', unsafe_allow_html=True)
+    st.caption(tx('把“有人提了但没人接”的事情变成有状态、有负责人、有下一步的协作任务。', '「声は上がったのに誰も拾わない」課題を、ステータス、担当者、次の行動が見える案件に変えます。'))
 
     statuses = ["待确认", "已受理", "推进中", "已完成", "暂缓", "已合并"]
     cols = st.columns(len(statuses))
     for col, status in zip(cols, statuses):
         count = sum(1 for task in data["tasks"] if task["status"] == status)
-        col.metric(status, count)
+        col.metric(ui_value(status), count)
 
     if is_admin():
         with st.expander("创建新事项", expanded=False):
@@ -2653,9 +2760,9 @@ def render_briefing_space(data: dict) -> None:
 
 
 def render_submit_feedback(data: dict) -> None:
-    st.markdown('<div class="section-title">提交反馈</div>', unsafe_allow_html=True)
-    st.caption("提交后会进入公开列表，便于集中整理和跟进。")
-    with st.expander("需要 AI 帮你整理表达？", expanded=False):
+    st.markdown(f'<div class="section-title">{tx("提交反馈", "声を届ける")}</div>', unsafe_allow_html=True)
+    st.caption(tx("提交后会进入公开列表，便于集中整理和跟进。", "投稿後は公開リストに表示され、整理と進捗確認に活用されます。"))
+    with st.expander(tx("需要 AI 帮你整理表达？", "AIで表現を整えますか？"), expanded=False):
         render_translator(data)
     render_submit_form(data)
 
@@ -2667,28 +2774,28 @@ def is_admin() -> bool:
 def render_admin_management(data: dict) -> None:
     if not is_admin() or not data["ideas"]:
         return
-    st.markdown('<div class="section-title">管理层处理台</div>', unsafe_allow_html=True)
-    st.caption("更新状态、负责人和正式回应；保存后会进入员工可见的时间线。")
+    st.markdown(f'<div class="section-title">{tx("管理层处理台", "管理層対応デスク")}</div>', unsafe_allow_html=True)
+    st.caption(tx("更新状态、负责人和正式回应；保存后会进入员工可见的时间线。", "ステータス、担当者、正式回答を更新します。保存後は公開タイムラインに反映されます。"))
     idea_options = {f'{idea["title"]} · {idea["status"]}': idea["id"] for idea in data["ideas"]}
-    selected_label = st.selectbox("选择反馈", list(idea_options), key="admin_selected_idea")
+    selected_label = st.selectbox(tx("选择反馈", "対象の声"), list(idea_options), key="admin_selected_idea")
     selected_id = idea_options[selected_label]
     idea = next(item for item in data["ideas"] if item["id"] == selected_id)
     statuses = ["待确认", "已受理", "推进中", "已完成", "暂缓"]
     current_index = statuses.index(idea["status"]) if idea["status"] in statuses else 0
     with st.form(f'admin_manage_{idea["id"]}'):
         left, right = st.columns(2)
-        new_status = left.selectbox("状态", statuses, index=current_index)
-        new_owner = right.text_input("负责人", value=idea.get("owner", "待确认"))
+        new_status = left.selectbox(tx("状态", "ステータス"), statuses, index=current_index, format_func=ui_value)
+        new_owner = right.text_input(tx("负责人", "担当者"), value=idea.get("owner", "待确认"))
         response = st.text_area(
-            "管理层回应",
+            tx("管理层回应", "管理層からの回答"),
             value=idea.get("management_response", ""),
-            placeholder="说明是否受理、为什么、接下来由谁处理。",
+            placeholder=tx("说明是否受理、为什么、接下来由谁处理。", "受付の有無、理由、次の担当者を説明してください。"),
             height=100,
         )
         next_update = st.text_input(
-            "下次更新时间",
+            tx("下次更新时间", "次回更新日"),
             value=idea.get("next_update_at", ""),
-            placeholder="例如：2026-07-17 或 本周五",
+            placeholder=tx("例如：2026-07-17 或 本周五", "例：2026-07-17 または 今週金曜日"),
         )
         merge_candidates = {
             "不合并": "",
@@ -2703,11 +2810,11 @@ def render_admin_management(data: dict) -> None:
             "不合并",
         )
         merge_into_label = st.selectbox(
-            "合并到主议题（可选）",
+            tx("合并到主议题（可选）", "主要テーマに統合（任意）"),
             list(merge_candidates),
             index=list(merge_candidates).index(current_merge_label),
         )
-        save_update = st.form_submit_button("发布回应与状态更新", use_container_width=True)
+        save_update = st.form_submit_button(tx("发布回应与状态更新", "回答とステータスを公開"), use_container_width=True)
     if save_update:
         merge_into_id = merge_candidates[merge_into_label]
         if merge_into_id:
@@ -2735,43 +2842,43 @@ def render_admin_management(data: dict) -> None:
 
 
 def render_feedback_progress(data: dict) -> None:
-    st.markdown('<div class="section-title">查看进度</div>', unsafe_allow_html=True)
-    st.caption("这里展示已经提交的反馈和正在推进的事项。")
+    st.markdown(f'<div class="section-title">{tx("查看进度", "進捗を見る")}</div>', unsafe_allow_html=True)
+    st.caption(tx("这里展示已经提交的反馈和正在推进的事项。", "届けられた声と、現在進んでいる案件を確認できます。"))
 
     pending_id = st.session_state.get("pending_delete_id", "")
     if pending_id:
         pending_idea = next((i for i in data["ideas"] if i["id"] == pending_id), None)
         if pending_idea:
-            st.warning(f"请输入「{pending_idea['title']}」的删除码以确认删除")
+            st.warning(tx(f"请输入「{pending_idea['title']}」的删除码以确认删除", f"「{pending_idea['title']}」を削除するため、削除コードを入力してください"))
             col1, col2, col3 = st.columns([1, 0.4, 0.4])
-            entered = col1.text_input("删除码", max_chars=4, label_visibility="collapsed", placeholder="输入提交时设置的4位删除码")
-            if col2.button("确认删除", type="primary"):
+            entered = col1.text_input(tx("删除码", "削除コード"), max_chars=4, label_visibility="collapsed", placeholder=tx("输入提交时设置的4位删除码", "投稿時に設定した4桁のコード"))
+            if col2.button(tx("确认删除", "削除する"), type="primary"):
                 if verify_delete_code(pending_idea, entered.strip()):
                     persist_delete_idea(data, pending_id)
                     liked_idea_ids().discard(pending_id)
                     st.session_state.pop("pending_delete_id", None)
-                    st.toast("已删除这条反馈。")
+                    st.toast(tx("已删除这条反馈。", "この声を削除しました。"))
                     st.rerun()
                 else:
-                    st.error("删除码不正确。")
-            if col3.button("取消"):
+                    st.error(tx("删除码不正确。", "削除コードが正しくありません。"))
+            if col3.button(tx("取消", "キャンセル")):
                 st.session_state.pop("pending_delete_id", None)
                 st.rerun()
             st.divider()
 
     if not data["ideas"]:
-        st.info('还没有反馈。可以先到“提交反馈”写下第一条。')
+        st.info(tx('还没有反馈。可以先到“提交反馈”写下第一条。', 'まだ声がありません。「声を届ける」から最初の投稿を書いてみましょう。'))
         return
     render_admin_management(data)
     categories = ["全部"] + sorted({i["category"] for i in data["ideas"]})
-    selected = st.segmented_control("反馈类型", categories, default="全部")
+    selected = st.segmented_control(tx("反馈类型", "カテゴリ"), categories, default="全部", format_func=lambda value: tx("全部", "すべて") if value == "全部" else ui_value(value))
     for idea in data["ideas"]:
         if selected != "全部" and idea["category"] != selected:
             continue
         render_idea_card(idea, show_actions=True, allow_delete=True)
         render_status_timeline(idea)
 
-    with st.expander("事项处理进度", expanded=False):
+    with st.expander(tx("事项处理进度", "案件の進捗"), expanded=False):
         render_tasks(data)
 
 
@@ -2793,6 +2900,21 @@ CONSTELLATION_NAMES = {
     "成长发展": "成长星座",
     "综合建议": "微光星座",
 }
+
+CONSTELLATION_NAMES_JA = {
+    "沟通协同": "情報の流れ座",
+    "权益激励": "ぬくもり座",
+    "流程规范": "秩序座",
+    "文化活动": "共創座",
+    "成长发展": "成長座",
+    "综合建议": "微光座",
+}
+
+
+def constellation_name(category: str) -> str:
+    if current_language() == "ja":
+        return CONSTELLATION_NAMES_JA.get(category, f"{ui_value(category)}座")
+    return CONSTELLATION_NAMES.get(category, f"{category}星座")
 
 
 CONSTELLATION_COLORS = {
@@ -2846,7 +2968,7 @@ def build_constellations(ideas: list[dict]) -> list[dict]:
         constellations.append(
             {
                 "category": category,
-                "name": CONSTELLATION_NAMES.get(category, f"{category}星座"),
+                "name": constellation_name(category),
                 "color": CONSTELLATION_COLORS.get(category, "#cbd5e1"),
                 "count": len(points),
                 "avg_heat": avg_heat,
@@ -2881,13 +3003,13 @@ def render_star_page(data: dict) -> None:
         detail_cards.append(
             f"""
             <div class="star-page-detail" id="{detail_id}">
-                <span class="sp-tag">{category}</span>
-                <span class="sp-tag" style="border-color:{color}; color:{color};">{status}</span>
-                <span class="sp-tag">热度 {idea["heat"]}%</span>
-                <a class="sp-close" href="#star-field">关闭</a>
+                <span class="sp-tag">{html.escape(ui_value(idea["category"]))}</span>
+                <span class="sp-tag" style="border-color:{color}; color:{color};">{html.escape(ui_value(idea["status"]))}</span>
+                <span class="sp-tag">{tx("热度", "注目度")} {idea["heat"]}%</span>
+                <a class="sp-close" href="#star-field">{tx("关闭", "閉じる")}</a>
                 <div class="sp-idea-title">{title}</div>
                 <p style="margin:6px 0 4px; color:#d5deed;">{content}</p>
-                <p style="margin:0; color:#9aa7bd; font-size:13px;">希望改进：{impact} · {created_at}</p>
+                <p style="margin:0; color:#9aa7bd; font-size:13px;">{tx("希望改进", "期待する改善")}：{impact} · {created_at}</p>
             </div>
             """
         )
@@ -2918,7 +3040,7 @@ def render_star_page(data: dict) -> None:
                 <span class="sp-constellation-dot" style="background:{color}; box-shadow:0 0 14px {color};"></span>
                 <div>
                     <strong>{html.escape(constellation["name"])}</strong>
-                    <span>{constellation["count"]} 颗星 · 平均热度 {constellation["avg_heat"]}%</span>
+                    <span>{tx(f'{constellation["count"]} 颗星 · 平均热度 {constellation["avg_heat"]}%', f'{constellation["count"]}個の星 · 平均注目度 {constellation["avg_heat"]}%')}</span>
                 </div>
             </div>
             """
@@ -2929,12 +3051,12 @@ def render_star_page(data: dict) -> None:
         if category in constellation_categories:
             continue
         x, y = star_position(index)
-        seed_name = CONSTELLATION_NAMES.get(category, f"{category}星座")
+        seed_name = constellation_name(category)
         seed_color = CONSTELLATION_COLORS.get(category, "#cbd5e1")
         constellation_seed_labels.append(
             f"""
             <div class="sp-constellation-seed" style="left:{x}%; top:{max(10, y + 6)}%; border-color:{seed_color}; color:{seed_color};">
-                {html.escape(seed_name)} · 待连接
+                {html.escape(seed_name)} · {tx("待连接", "接続待ち")}
             </div>
             """
         )
@@ -2962,19 +3084,19 @@ def render_star_page(data: dict) -> None:
     if constellations:
         constellation_panel = f"""
         <div class="sp-constellation-panel">
-            <div class="sp-panel-title">意见星座</div>
+            <div class="sp-panel-title">{tx("意见星座", "声の星座")}</div>
             {''.join(constellation_panel_items)}
         </div>
         """
     elif ideas:
-        constellation_panel = """
+        constellation_panel = f"""
         <div class="sp-constellation-panel">
-            <div class="sp-panel-title">意见星座</div>
-            <p>第一颗星已经出现，等待更多同频意见连成星座。</p>
+            <div class="sp-panel-title">{tx("意见星座", "声の星座")}</div>
+            <p>{tx("第一颗星已经出现，等待更多同频意见连成星座。", "最初の星が現れました。同じ想いが集まり、星座になるのを待っています。")}</p>
         </div>
         """
 
-    empty_text = "" if ideas else "<p style='color:#9aa7bd;margin:12px 0 0;'>还没有反馈，提交第一条后这里会出现第一颗星。</p>"
+    empty_text = "" if ideas else f"<p style='color:#9aa7bd;margin:12px 0 0;'>{tx('还没有反馈，提交第一条后这里会出现第一颗星。', 'まだ声はありません。最初の投稿がここで最初の星になります。')}</p>"
 
     star_page_html = f"""
         <style>
@@ -3346,17 +3468,18 @@ def render_star_page(data: dict) -> None:
             <div class="star-page" id="star-field" style="background-image: url('{hero_uri}');">
                 <span class="sp-anchor" id="constellation-notes"></span>
                 <div class="star-page-title">
-                    <h2>意见像星星一样被看见</h2>
-                    <p>把分散的想法放在同一片天空里，方便大家查看和跟进。</p>
+                    <h2>{tx("意见像星星一样被看见", "声が星のように見える")}</h2>
+                    <p>{tx("把分散的想法放在同一片天空里，方便大家查看和跟进。", "ばらばらの想いをひとつの夜空に集め、みんなで見守ります。")}</p>
                     {empty_text}
                 </div>
                 <form class="sp-back-form" method="get">
                     <input type="hidden" name="view" value="landing">
-                    <button class="sp-back-button" type="submit">← 返回</button>
+                    {language_query_field()}
+                    <button class="sp-back-button" type="submit">← {tx("返回", "戻る")}</button>
                 </form>
                 <div class="sp-view-tools">
-                    <a class="sp-layer-toggle sp-show-notes" href="#constellation-notes">显示星座说明</a>
-                    <a class="sp-layer-toggle sp-hide-notes" href="#star-field">隐藏星座说明</a>
+                    <a class="sp-layer-toggle sp-show-notes" href="#constellation-notes">{tx("显示星座说明", "星座の説明を表示")}</a>
+                    <a class="sp-layer-toggle sp-hide-notes" href="#star-field">{tx("隐藏星座说明", "星座の説明を隠す")}</a>
                 </div>
                 {constellation_svg}
                 <div class="sp-notes-layer">
@@ -3383,6 +3506,16 @@ def make_echo_text(idea: dict) -> str:
         "成长发展": "这份期待指向更长远的东西：让努力被看见，也让成长有方向。",
         "综合建议": "这是一颗小小的信号，提醒我们把模糊的不舒服变成可以讨论的改进。",
     }
+    if current_language() == "ja":
+        templates = {
+            "沟通协同": "これは不満ではなく、情報をより早く、努力しているすべての人に届けてほしいというサインです。",
+            "权益激励": "配慮されているという実感が、次の一歩につながります。",
+            "流程规范": "その場しのぎを減らし、誰もが迷わず進める道筋を求める声です。",
+            "文化活动": "イベントを一方的に決めるのではなく、みんなでつくりたいという願いです。",
+            "成长发展": "努力を見つけ、成長の方向を一緒に描いてほしいという期待です。",
+            "综合建议": "小さなサインが、まだ言葉になっていない違和感を改善の対話へ変えてくれます。",
+        }
+        return templates.get(category, f'「{title[:18]}」に関する声が、丁寧な回答を待っています。')
     return templates.get(category, f'关于"{title[:18]}"的声音，正在等待一次认真回应。')
 
 
@@ -3398,14 +3531,14 @@ def render_echo_wall(data: dict) -> None:
     for index, idea in enumerate(ideas[:10]):
         x, y = positions[index % len(positions)]
         delay = round((index % 5) * 0.7, 1)
-        category = html.escape(str(idea.get("category") or "综合建议"))
+        category = html.escape(ui_value(idea.get("category") or "综合建议"))
         title = html.escape(str(idea.get("title") or "未命名反馈"))
         echo = html.escape(make_echo_text(idea))
         heat = int(idea.get("heat", 0) or 0)
         echo_cards.append(
             f"""
             <div class="echo-card" style="left:{x}%; top:{y}%; animation-delay:{delay}s;">
-                <span>{category} · 热度 {heat}%</span>
+                <span>{category} · {tx("热度", "注目度")} {heat}%</span>
                 <strong>{title}</strong>
                 <p>{echo}</p>
             </div>
@@ -3414,9 +3547,9 @@ def render_echo_wall(data: dict) -> None:
 
     empty_text = ""
     if not ideas:
-        empty_text = """
+        empty_text = f"""
         <div class="echo-empty">
-            还没有可以回响的反馈。第一条真实声音，会成为这里的第一道回声。
+            {tx("还没有可以回响的反馈。第一条真实声音，会成为这里的第一道回声。", "まだ響き合う声はありません。最初の率直な声が、ここで最初のエコーになります。")}
         </div>
         """
 
@@ -3614,16 +3747,18 @@ def render_echo_wall(data: dict) -> None:
             <div class="echo-wall">
                 <form class="echo-back-form" method="get">
                     <input type="hidden" name="view" value="landing">
-                    <button class="echo-back-button" type="submit">← 返回</button>
+                    {language_query_field()}
+                    <button class="echo-back-button" type="submit">← {tx("返回", "戻る")}</button>
                 </form>
                 <form method="get" style="margin:0;">
                     <input type="hidden" name="view" value="workspace">
                     <input type="hidden" name="page" value="progress">
-                    <button class="echo-progress-link" type="submit">查看进度</button>
+                    {language_query_field()}
+                    <button class="echo-progress-link" type="submit">{tx("查看进度", "進捗を見る")}</button>
                 </form>
                 <div class="echo-title">
-                    <h2>回声墙</h2>
-                    <p>每一条反馈都会留下一个更柔和的回响。这里不展示抱怨，而展示那些值得被认真听见的提醒。</p>
+                    <h2>{tx("回声墙", "エコーウォール")}</h2>
+                    <p>{tx("每一条反馈都会留下一个更柔和的回响。这里不展示抱怨，而展示那些值得被认真听见的提醒。", "ひとつひとつの声が、やわらかな響きとして残ります。ここにあるのは不満ではなく、丁寧に耳を傾けたい大切な気づきです。")}</p>
                 </div>
                 {''.join(echo_cards)}
                 {empty_text}
@@ -3636,10 +3771,13 @@ def render_echo_wall(data: dict) -> None:
 def postcard_summary_line(data: dict) -> str:
     ideas = data["ideas"]
     if not ideas:
-        return "本周还没有新的员工反馈，建议先用一个轻量入口收集第一批真实声音。"
+        return tx("本周还没有新的员工反馈，建议先用一个轻量入口收集第一批真实声音。", "今週はまだ新しい声がありません。まずは気軽な入口から、最初の率直な声を集めましょう。")
     top_category, count = Counter(idea["category"] for idea in ideas).most_common(1)[0]
     avg_heat = round(sum(idea["heat"] for idea in ideas) / max(len(ideas), 1))
-    return f"本期共收到 {len(ideas)} 条反馈，最集中的议题是「{top_category}」{count} 条，平均热度 {avg_heat}%。"
+    return tx(
+        f"本期共收到 {len(ideas)} 条反馈，最集中的议题是「{top_category}」{count} 条，平均热度 {avg_heat}%。",
+        f"今期は{len(ideas)}件の声が届きました。最も多いテーマは「{ui_value(top_category)}」の{count}件、平均注目度は{avg_heat}%です。",
+    )
 
 
 def render_management_postcard(data: dict) -> None:
@@ -3653,34 +3791,34 @@ def render_management_postcard(data: dict) -> None:
     open_tasks = [task for task in tasks if task["status"] in {"待确认", "已受理", "推进中"}]
     completed = sum(1 for task in tasks if task["status"] == "已完成")
     response_idea = hot_ideas[0] if hot_ideas else None
-    response_line = make_echo_text(response_idea) if response_idea else "请给员工一个能被看见、能被回应的固定入口。"
+    response_line = make_echo_text(response_idea) if response_idea else tx("请给员工一个能被看见、能被回应的固定入口。", "従業員の声が見える形で届き、回答を得られる定着した入口をつくりましょう。")
 
     hot_items = []
     for idea in hot_ideas:
         hot_items.append(
             f"""
             <div class="pc-hot-item">
-                <span>{html.escape(str(idea.get("category", "综合建议")))} · 热度 {int(idea.get("heat", 0) or 0)}%</span>
+                <span>{html.escape(ui_value(idea.get("category", "综合建议")))} · {tx("热度", "注目度")} {int(idea.get("heat", 0) or 0)}%</span>
                 <strong>{html.escape(str(idea.get("title", "未命名反馈")))}</strong>
             </div>
             """
         )
     if not hot_items:
         hot_items.append(
-            """
+            f"""
             <div class="pc-hot-item">
-                <span>等待第一条反馈</span>
-                <strong>先让真实声音有一个落点。</strong>
+                <span>{tx("等待第一条反馈", "最初の声を待っています")}</span>
+                <strong>{tx("先让真实声音有一个落点。", "率直な声が届く場所を、ここから。")}</strong>
             </div>
             """
         )
 
-    constellation_name = "尚未形成星座"
-    constellation_detail = "当同类反馈达到 2 条以上，会自动连成共性议题。"
+    constellation_name = tx("尚未形成星座", "まだ星座はありません")
+    constellation_detail = tx("当同类反馈达到 2 条以上，会自动连成共性议题。", "同じ種類の声が2件以上集まると、共通テーマの星座になります。")
     constellation_color = "#cbd5e1"
     if main_constellation:
         constellation_name = html.escape(str(main_constellation["name"]))
-        constellation_detail = f'{main_constellation["count"]} 颗星 · 平均热度 {main_constellation["avg_heat"]}%'
+        constellation_detail = tx(f'{main_constellation["count"]} 颗星 · 平均热度 {main_constellation["avg_heat"]}%', f'{main_constellation["count"]}個の星 · 平均注目度 {main_constellation["avg_heat"]}%')
         constellation_color = str(main_constellation["color"])
 
     summary = html.escape(postcard_summary_line(data))
@@ -4008,44 +4146,46 @@ def render_management_postcard(data: dict) -> None:
         <div class="pc-shell">
             <form class="pc-back-form" method="get">
                 <input type="hidden" name="view" value="landing">
-                <button class="pc-back-button" type="submit">← 返回</button>
+                {language_query_field()}
+                <button class="pc-back-button" type="submit">← {tx("返回", "戻る")}</button>
             </form>
             <form method="get" style="margin:0;">
                 <input type="hidden" name="view" value="workspace">
                 <input type="hidden" name="page" value="progress">
-                <button class="pc-progress-link" type="submit">查看进度</button>
+                {language_query_field()}
+                <button class="pc-progress-link" type="submit">{tx("查看进度", "進捗を見る")}</button>
             </form>
             <section class="pc-card">
                 <div class="pc-photo">
                     <h2>From Fuji</h2>
-                    <p>把员工反馈整理成一张能被快速阅读、截图转发、用于决策沟通的明信片。</p>
+                    <p>{tx("把员工反馈整理成一张能被快速阅读、截图转发、用于决策沟通的明信片。", "従業員の声を、すぐに読めて共有でき、意思決定の対話に使える一枚のポストカードへ。")}</p>
                 </div>
                 <div class="pc-content">
                     <div class="pc-stamp">STELLAR<br>{date_text}</div>
                     <div class="pc-kicker">To Management</div>
-                    <h1>本周员工声音明信片</h1>
+                    <h1>{tx("本周员工声音明信片", "今週の従業員ボイス・ポストカード")}</h1>
                     <p class="pc-summary">{summary}</p>
                     <div class="pc-metrics">
-                        <div class="pc-metric"><span>反馈总数</span><strong>{len(ideas)}</strong></div>
-                        <div class="pc-metric"><span>开放事项</span><strong>{len(open_tasks)}</strong></div>
-                        <div class="pc-metric"><span>已完成</span><strong>{completed}</strong></div>
+                        <div class="pc-metric"><span>{tx("反馈总数", "声の合計")}</span><strong>{len(ideas)}</strong></div>
+                        <div class="pc-metric"><span>{tx("开放事项", "対応中")}</span><strong>{len(open_tasks)}</strong></div>
+                        <div class="pc-metric"><span>{tx("已完成", "完了")}</span><strong>{completed}</strong></div>
                     </div>
-                    <div class="pc-section-title">最亮的 3 颗星</div>
+                    <div class="pc-section-title">{tx("最亮的 3 颗星", "最も輝く3つの星")}</div>
                     <div class="pc-hot-list">{''.join(hot_items)}</div>
                     <div class="pc-bottom-grid">
                         <div>
-                            <div class="pc-section-title">最大星座</div>
+                            <div class="pc-section-title">{tx("最大星座", "最大の星座")}</div>
                             <div class="pc-constellation">
                                 <span class="pc-constellation-dot"></span>
                                 <div><strong>{constellation_name}</strong><span>{constellation_detail}</span></div>
                             </div>
                         </div>
                         <div>
-                            <div class="pc-section-title">最需要回应的一句话</div>
+                            <div class="pc-section-title">{tx("最需要回应的一句话", "今、最も回答が必要な一言")}</div>
                             <div class="pc-response">{response_line}</div>
                         </div>
                     </div>
-                    <div class="pc-signoff">Stellar · 员工反馈与协同<br>{now_str()}</div>
+                    <div class="pc-signoff">Stellar · {tx("员工反馈与协同", "従業員の声と連携")}<br>{now_str()}</div>
                 </div>
             </section>
         </div>
@@ -4068,57 +4208,67 @@ def render_settings_panel() -> None:
 
 def render_admin_login() -> None:
     admin_password = get_secret_value("ADMIN_PASSWORD")
-    with st.expander("管理入口", expanded=is_admin()):
+    with st.expander(tx("管理入口", "管理者メニュー"), expanded=is_admin()):
         if is_admin():
-            st.success("管理员模式已开启")
-            if st.button("退出管理员模式", use_container_width=True):
+            st.success(tx("管理员模式已开启", "管理者モードです"))
+            if st.button(tx("退出管理员模式", "管理者モードを終了"), use_container_width=True):
                 st.session_state.pop("admin_authenticated", None)
                 st.rerun()
             return
         if not admin_password:
-            st.caption("尚未配置 ADMIN_PASSWORD。")
+            st.caption(tx("尚未配置 ADMIN_PASSWORD。", "ADMIN_PASSWORD が設定されていません。"))
             return
         with st.form("admin_login_form"):
-            entered = st.text_input("管理员密码", type="password")
-            login = st.form_submit_button("进入管理模式", use_container_width=True)
+            entered = st.text_input(tx("管理员密码", "管理者パスワード"), type="password")
+            login = st.form_submit_button(tx("进入管理模式", "管理者モードへ"), use_container_width=True)
         if login:
             if hmac.compare_digest(entered, admin_password):
                 st.session_state["admin_authenticated"] = True
                 st.rerun()
             else:
-                st.error("管理员密码不正确。")
+                st.error(tx("管理员密码不正确。", "管理者パスワードが正しくありません。"))
 
 
 def sidebar(data: dict) -> None:
     with st.sidebar:
         st.markdown("## Stellar")
-        st.caption("反馈收集 · 进度公开")
-        if st.button("返回入口页", use_container_width=True):
+        st.caption(tx("反馈收集 · 进度公开", "声の収集 · 進捗の公開"))
+        language_label = "日本語" if current_language() == "ja" else "中文"
+        st.session_state.setdefault("language_switch", language_label)
+        selected_language = st.segmented_control("Language", list(LANGUAGE_OPTIONS), key="language_switch")
+        if LANGUAGE_OPTIONS[selected_language] != current_language():
+            sync_language_from_widget("language_switch")
+            st.rerun()
+        if st.button(tx("返回入口页", "トップへ戻る"), use_container_width=True):
             st.session_state["view"] = "landing"
             st.query_params.clear()
+            st.query_params["lang"] = current_language()
             st.rerun()
         st.divider()
-        st.metric("想法总数", len(data["ideas"]))
-        st.metric("事项总数", len(data["tasks"]))
+        st.metric(tx("想法总数", "声の合計"), len(data["ideas"]))
+        st.metric(tx("事项总数", "案件の合計"), len(data["tasks"]))
         st.divider()
-        st.markdown("**共鸣空间**")
-        if st.button("星空意见图", key="sidebar_stars", use_container_width=True):
+        st.markdown(f'**{tx("共鸣空间", "共感スペース")}**')
+        if st.button(tx("星空意见图", "星空ボイスマップ"), key="sidebar_stars", use_container_width=True):
             st.session_state["view"] = "stars"
             st.query_params.clear()
             st.query_params["view"] = "stars"
+            st.query_params["lang"] = current_language()
             st.rerun()
-        if st.button("回声墙", key="sidebar_echoes", use_container_width=True):
+        if st.button(tx("回声墙", "エコーウォール"), key="sidebar_echoes", use_container_width=True):
             st.session_state["view"] = "echoes"
             st.query_params.clear()
             st.query_params["view"] = "echoes"
+            st.query_params["lang"] = current_language()
             st.rerun()
         st.divider()
         render_admin_login()
         if is_admin():
-            if st.button("管理层明信片", key="sidebar_postcard", use_container_width=True):
+            if st.button(tx("管理层明信片", "管理層へのポストカード"), key="sidebar_postcard", use_container_width=True):
                 st.session_state["view"] = "postcard"
                 st.query_params.clear()
                 st.query_params["view"] = "postcard"
+                st.query_params["lang"] = current_language()
                 st.rerun()
             st.divider()
             st.download_button(
@@ -4186,6 +4336,15 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    query_language = st.query_params.get("lang", "")
+    if query_language in LANGUAGE_OPTIONS.values():
+        st.session_state["language"] = query_language
+        query_label = next(label for label, code in LANGUAGE_OPTIONS.items() if code == query_language)
+        for widget_key in ("language_switch",):
+            if widget_key in st.session_state:
+                st.session_state[widget_key] = query_label
+    elif "language" not in st.session_state:
+        st.session_state["language"] = "zh"
     inject_css()
     data = load_data()
     token = get_session_token()
@@ -4210,6 +4369,7 @@ def main() -> None:
     elif qv == "landing":
         st.session_state["view"] = "landing"
         st.query_params.clear()
+        st.query_params["lang"] = current_language()
 
     if st.session_state["view"] == "landing":
         render_landing(data)
@@ -4231,15 +4391,20 @@ def main() -> None:
         st.query_params.clear()
         st.query_params["view"] = "workspace"
         st.query_params["page"] = "progress"
-        st.session_state["pending_toast"] = "请先从侧边栏进入管理员模式。"
+        st.session_state["pending_toast"] = tx("请先从侧边栏进入管理员模式。", "先にサイドバーから管理者モードに入ってください。")
         st.rerun()
 
     sidebar(data)
     page_param = st.query_params.get("page")
-    default_page = {"progress": "查看进度"}.get(page_param, "提交反馈")
-    page = st.segmented_control("页面", ["提交反馈", "查看进度"], default=default_page)
+    default_page = {"progress": "progress"}.get(page_param, "submit")
+    page = st.segmented_control(
+        tx("页面", "ページ"),
+        ["submit", "progress"],
+        default=default_page,
+        format_func=lambda value: tx("提交反馈", "声を届ける") if value == "submit" else tx("查看进度", "進捗を見る"),
+    )
     render_hero(data)
-    if page == "提交反馈":
+    if page == "submit":
         render_submit_feedback(data)
     else:
         render_feedback_progress(data)
