@@ -33,6 +33,15 @@ create table if not exists public.stellar_votes (
   primary key (idea_id, voter_token)
 );
 
+create table if not exists public.stellar_resolution_ratings (
+  idea_id text not null references public.stellar_ideas(id) on delete cascade,
+  voter_token text not null,
+  rating text not null check (rating in ('resolved', 'partial', 'unresolved')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (idea_id, voter_token)
+);
+
 create table if not exists public.stellar_tasks (
   id text primary key,
   name text not null,
@@ -63,6 +72,7 @@ create table if not exists public.stellar_status_history (
 create index if not exists stellar_ideas_created_at_idx on public.stellar_ideas(created_at desc);
 create index if not exists stellar_ideas_merged_into_idx on public.stellar_ideas(merged_into_id);
 create index if not exists stellar_history_idea_idx on public.stellar_status_history(idea_id, created_at);
+create index if not exists stellar_resolution_idea_idx on public.stellar_resolution_ratings(idea_id);
 
 create or replace function public.stellar_cast_vote(p_idea_id text, p_voter_token text)
 returns boolean
@@ -90,15 +100,18 @@ $$;
 
 alter table public.stellar_ideas enable row level security;
 alter table public.stellar_votes enable row level security;
+alter table public.stellar_resolution_ratings enable row level security;
 alter table public.stellar_tasks enable row level security;
 alter table public.stellar_status_history enable row level security;
 
 revoke all on table public.stellar_ideas from anon, authenticated;
 revoke all on table public.stellar_votes from anon, authenticated;
+revoke all on table public.stellar_resolution_ratings from anon, authenticated;
 revoke all on table public.stellar_tasks from anon, authenticated;
 revoke all on table public.stellar_status_history from anon, authenticated;
 grant all on table public.stellar_ideas to service_role;
 grant all on table public.stellar_votes to service_role;
+grant all on table public.stellar_resolution_ratings to service_role;
 grant all on table public.stellar_tasks to service_role;
 grant all on table public.stellar_status_history to service_role;
 grant usage, select on sequence public.stellar_status_history_id_seq to service_role;

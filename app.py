@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from email.message import EmailMessage
 import hashlib
 import html
 import hmac
@@ -8,8 +9,9 @@ import json
 import math
 import os
 import re
+import smtplib
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,6 +25,7 @@ DATA_FILE = Path("pulse_data.json")
 SUPABASE_TABLE = "stellar_data"
 SUPABASE_IDEAS_TABLE = "stellar_ideas"
 SUPABASE_VOTES_TABLE = "stellar_votes"
+SUPABASE_RESOLUTION_RATINGS_TABLE = "stellar_resolution_ratings"
 SUPABASE_TASKS_TABLE = "stellar_tasks"
 SUPABASE_HISTORY_TABLE = "stellar_status_history"
 HERO_IMAGE = Path("assets/fuji-hero.webp")
@@ -253,6 +256,14 @@ def normalize_idea(idea: dict) -> dict:
     normalized["merged_into_id"] = str(normalized.get("merged_into_id") or "")
     normalized["delete_code_hash"] = str(normalized.get("delete_code_hash") or "")
     normalized["history"] = list(normalized.get("history") or [])
+    counts = normalized.get("resolution_counts") or {}
+    normalized["resolution_counts"] = {
+        "resolved": max(0, int(counts.get("resolved", 0) or 0)),
+        "partial": max(0, int(counts.get("partial", 0) or 0)),
+        "unresolved": max(0, int(counts.get("unresolved", 0) or 0)),
+    }
+    normalized["resolution_ratings"] = dict(normalized.get("resolution_ratings") or {})
+    normalized["my_resolution_rating"] = str(normalized.get("my_resolution_rating") or "")
     normalized["heat"] = recalculate_idea_heat(normalized)
     normalized["created_at"] = str(normalized.get("created_at") or now_str())
     return normalized
@@ -330,7 +341,10 @@ def verify_delete_code(idea: dict, entered: str) -> bool:
     stored_hash = str(idea.get("delete_code_hash") or "")
     if stored_hash:
         return hmac.compare_digest(stored_hash, hash_delete_code(entered, str(idea["id"])))
-    return hmac.compare_digest(str(idea.get("delete_code") or ""), entered)
+    stored_legacy_code = str(idea.get("delete_code") or "")
+    if not stored_legacy_code:
+        return False
+    return hmac.compare_digest(stored_legacy_code, entered)
 
 
 def supabase_get(url: str, key: str, table: str, params: dict | None = None) -> list[dict]:
@@ -457,24 +471,59 @@ def load_normalized_remote_data(url: str, key: str) -> dict:
         SUPABASE_VOTES_TABLE,
         {"select": "idea_id", "voter_token": f"eq.{token}"},
     )
+    resolution_ratings_available = True
+    try:
+        rating_rows = supabase_get(
+            url,
+            key,
+            SUPABASE_RESOLUTION_RATINGS_TABLE,
+            {"select": "idea_id,voter_token,rating"},
+        )
+    except Exception:
+        rating_rows = []
+        resolution_ratings_available = False
     voted_ids = {row["idea_id"] for row in own_votes}
     history_by_idea: dict[str, list[dict]] = {}
     for row in history_rows:
         history_by_idea.setdefault(str(row["idea_id"]), []).append(row)
+    ratings_by_idea: dict[str, dict] = {}
+    for row in rating_rows:
+        idea_id = str(row.get("idea_id") or "")
+        rating = str(row.get("rating") or "")
+        if rating not in {"resolved", "partial", "unresolved"}:
+            continue
+        rating_data = ratings_by_idea.setdefault(
+            idea_id,
+            {
+                "counts": {"resolved": 0, "partial": 0, "unresolved": 0},
+                "mine": "",
+            },
+        )
+        rating_data["counts"][rating] += 1
+        if str(row.get("voter_token") or "") == token:
+            rating_data["mine"] = rating
     ideas = []
     for row in idea_rows:
         idea = normalize_idea(row)
         idea["history"] = history_by_idea.get(idea["id"], [])
         idea["voters"] = [token] if idea["id"] in voted_ids else []
+        rating_data = ratings_by_idea.get(idea["id"], {})
+        idea["resolution_counts"] = rating_data.get(
+            "counts",
+            {"resolved": 0, "partial": 0, "unresolved": 0},
+        )
+        idea["my_resolution_rating"] = rating_data.get("mine", "")
         ideas.append(idea)
     legacy = load_legacy_remote_data(url, key) or DEFAULT_DATA
-    return normalize_data(
+    loaded = normalize_data(
         {
             **legacy,
             "ideas": ideas,
             "tasks": [normalize_task(row) for row in task_rows],
         }
     )
+    loaded["_resolution_ratings_available"] = resolution_ratings_available
+    return loaded
 
 
 def save_normalized_remote_data(url: str, key: str, data: dict) -> None:
@@ -556,6 +605,42 @@ def persist_vote(idea: dict, token: str, data: dict) -> bool:
     )
     response.raise_for_status()
     return bool(response.json())
+
+
+def persist_resolution_rating(idea: dict, rating: str, token: str, data: dict) -> bool:
+    if rating not in {"resolved", "partial", "unresolved"}:
+        return False
+    config = get_normalized_supabase_config()
+    if not config:
+        ratings = dict(idea.get("resolution_ratings") or {})
+        previous = str(ratings.get(token) or "")
+        ratings[token] = rating
+        idea["resolution_ratings"] = ratings
+        idea["my_resolution_rating"] = rating
+        counts = {"resolved": 0, "partial": 0, "unresolved": 0}
+        for value in ratings.values():
+            if value in counts:
+                counts[value] += 1
+        idea["resolution_counts"] = counts
+        save_data(data)
+        return previous != rating
+    if not data.get("_resolution_ratings_available", False):
+        raise RuntimeError(tx("请先在 Supabase 运行最新的 supabase_schema.sql。", "Supabase で最新の supabase_schema.sql を実行してください。"))
+    url, key = config
+    response = requests.post(
+        f"{url}/rest/v1/{SUPABASE_RESOLUTION_RATINGS_TABLE}",
+        headers={**supabase_headers(key), "Prefer": "resolution=merge-duplicates,return=minimal"},
+        params={"on_conflict": "idea_id,voter_token"},
+        json={
+            "idea_id": idea["id"],
+            "voter_token": token,
+            "rating": rating,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        timeout=12,
+    )
+    response.raise_for_status()
+    return str(idea.get("my_resolution_rating") or "") != rating
 
 
 def persist_delete_idea(data: dict, idea_id: str) -> None:
@@ -696,6 +781,160 @@ def get_secret_value(name: str) -> str:
         return str(st.secrets.get(name, "") or "")
     except Exception:
         return ""
+
+
+def notification_recipients() -> list[str]:
+    raw = get_secret_value("ADMIN_EMAIL") or get_secret_value("NOTIFICATION_EMAIL")
+    return [item.strip() for item in re.split(r"[,;\n]+", raw) if item.strip()]
+
+
+def send_new_feedback_notification(idea: dict) -> str:
+    """Send a best-effort Gmail notification after a feedback is persisted."""
+    sender = get_secret_value("GMAIL_SENDER_EMAIL").strip()
+    app_password = get_secret_value("GMAIL_APP_PASSWORD").replace(" ", "").strip()
+    recipients = notification_recipients()
+    if not sender or not app_password or not recipients:
+        return "unconfigured"
+
+    app_url = get_secret_value("STELLAR_APP_URL").strip()
+    link_line = f"查看应用：{app_url}" if app_url else "请打开 Stellar 查看这条反馈。"
+    subject = f"[Stellar] 新反馈：{idea.get('title', '未命名反馈')}"
+    body = "\n".join(
+        [
+            "Stellar 收到一条新的员工反馈。",
+            "",
+            f"标题：{idea.get('title', '')}",
+            f"分类：{idea.get('category', '综合建议')}",
+            f"提交者：{idea.get('author', '匿名')}",
+            f"热度：{idea.get('heat', 0)}%",
+            f"提交时间：{idea.get('created_at', '')}",
+            "",
+            "反馈内容：",
+            str(idea.get("content", "")),
+            "",
+            "希望如何改进：",
+            str(idea.get("impact", "")),
+            "",
+            link_line,
+        ]
+    )
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    message.set_content(body)
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+            smtp.login(sender, app_password)
+            smtp.send_message(message)
+        return "sent"
+    except Exception as exc:
+        print(f"Stellar email notification failed: {exc}")
+        return "failed"
+
+
+def parse_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return parsed.astimezone(timezone.utc)
+
+
+def response_sla_hours() -> int:
+    try:
+        return max(1, int(get_secret_value("RESPONSE_SLA_HOURS") or 72))
+    except ValueError:
+        return 72
+
+
+def idea_response_deadline(idea: dict) -> datetime:
+    created_at = parse_timestamp(idea.get("created_at")) or datetime.now(timezone.utc)
+    return created_at + timedelta(hours=response_sla_hours())
+
+
+def idea_first_response_at(idea: dict) -> datetime | None:
+    system_actors = {"系统", "系统迁移", "System"}
+    for event in idea.get("history") or []:
+        if not str(event.get("response") or "").strip():
+            continue
+        if str(event.get("actor") or "") in system_actors:
+            continue
+        responded_at = parse_timestamp(event.get("created_at"))
+        if responded_at:
+            return responded_at
+    if idea.get("management_response"):
+        return parse_timestamp(idea.get("updated_at")) or parse_timestamp(idea.get("created_at"))
+    return None
+
+
+def idea_last_updated_at(idea: dict) -> datetime:
+    history_dates = [
+        parsed
+        for event in idea.get("history") or []
+        if (parsed := parse_timestamp(event.get("created_at"))) is not None
+    ]
+    return max(
+        [
+            parse_timestamp(idea.get("updated_at")),
+            parse_timestamp(idea.get("created_at")),
+            *history_dates,
+        ],
+        key=lambda value: value or datetime.min.replace(tzinfo=timezone.utc),
+    ) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def format_duration(delta: timedelta) -> str:
+    total_minutes = max(0, round(delta.total_seconds() / 60))
+    if total_minutes < 60:
+        return tx(f"{max(1, total_minutes)} 分钟", f"{max(1, total_minutes)}分")
+    total_hours = round(total_minutes / 60)
+    if total_hours < 24:
+        return tx(f"{total_hours} 小时", f"{total_hours}時間")
+    days = total_hours // 24
+    hours = total_hours % 24
+    return tx(f"{days} 天 {hours} 小时", f"{days}日 {hours}時間")
+
+
+def response_sla_info(idea: dict) -> dict:
+    deadline = idea_response_deadline(idea)
+    first_response = idea_first_response_at(idea)
+    now = datetime.now(timezone.utc)
+    if idea.get("status") == "已合并":
+        return {"state": "merged", "label": tx("已合并", "統合済み"), "detail": "", "deadline": deadline}
+    if first_response:
+        elapsed = format_duration(first_response - (parse_timestamp(idea.get("created_at")) or first_response))
+        on_time = first_response <= deadline
+        return {
+            "state": "responded" if on_time else "responded_late",
+            "label": tx("已按时回应", "期限内に回答") if on_time else tx("已回应（曾超时）", "回答済み（期限超過）"),
+            "detail": tx(f"首次响应用时 {elapsed}", f"初回回答まで {elapsed}"),
+            "deadline": deadline,
+        }
+    if now > deadline:
+        overdue = format_duration(now - deadline)
+        return {
+            "state": "overdue",
+            "label": tx("回应已超时", "回答期限超過"),
+            "detail": tx(f"已超时 {overdue}", f"{overdue}超過"),
+            "deadline": deadline,
+        }
+    remaining = format_duration(deadline - now)
+    return {
+        "state": "pending",
+        "label": tx("回应倒计时", "回答まで"),
+        "detail": tx(f"还剩 {remaining}", f"残り {remaining}"),
+        "deadline": deadline,
+    }
+
+
+def idea_is_overdue(idea: dict) -> bool:
+    return response_sla_info(idea)["state"] == "overdue"
 
 
 def get_gemini_config() -> tuple[str, str]:
@@ -1144,6 +1383,53 @@ def inject_css() -> None:
             font-size: 13px;
         }
 
+        .sla-strip {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-top: 12px;
+            padding: 9px 11px;
+            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            background: rgba(255, 255, 255, 0.045);
+            color: #cbd5e1;
+            font-size: 12px;
+        }
+
+        .sla-strip strong {
+            color: #f7fbff;
+        }
+
+        .sla-strip.overdue {
+            border-color: rgba(255, 107, 107, 0.42);
+            background: rgba(255, 107, 107, 0.10);
+        }
+
+        .sla-strip.overdue strong {
+            color: #ff9b9b;
+        }
+
+        .sla-strip.responded,
+        .sla-strip.responded_late {
+            border-color: rgba(94, 234, 212, 0.28);
+            background: rgba(94, 234, 212, 0.07);
+        }
+
+        .progress-focus-title {
+            margin: 24px 0 10px;
+            color: #f7fbff;
+            font-size: 17px;
+            font-weight: 850;
+        }
+
+        .resolution-summary {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 7px;
+            margin: 10px 0 2px;
+        }
+
         .status-timeline {
             position: relative;
             margin: -2px 0 18px 20px;
@@ -1359,10 +1645,10 @@ def inject_css() -> None:
         }
 
         .weather-fog .weather-atmosphere {
-            opacity: 0.78;
+            opacity: 0.20;
             background:
-                linear-gradient(100deg, transparent 10%, rgba(210, 222, 232, 0.28) 42%, transparent 72%),
-                linear-gradient(80deg, transparent 26%, rgba(255, 255, 255, 0.18) 58%, transparent 86%);
+                linear-gradient(100deg, transparent 10%, rgba(210, 222, 232, 0.16) 42%, transparent 72%),
+                linear-gradient(80deg, transparent 26%, rgba(255, 255, 255, 0.10) 58%, transparent 86%);
             animation: weatherDrift 12s ease-in-out infinite alternate;
         }
 
@@ -1808,6 +2094,7 @@ def organization_weather(data: dict) -> dict:
     ideas = [idea for idea in data["ideas"] if idea.get("status") != "已合并"]
     active = [idea for idea in ideas if idea.get("status") not in {"已完成", "已合并"}]
     unanswered = [idea for idea in active if not idea.get("management_response")]
+    overdue = [idea for idea in unanswered if idea_is_overdue(idea)]
     high_unanswered = [idea for idea in unanswered if int(idea.get("heat", 0) or 0) >= 70]
     responded = [idea for idea in ideas if idea.get("management_response")]
     completed = sum(1 for idea in ideas if idea.get("status") == "已完成") + sum(
@@ -1817,6 +2104,19 @@ def organization_weather(data: dict) -> dict:
     top_category = category_counter.most_common(1)[0][0] if category_counter else "暂无集中议题"
     response_rate = round(len(responded) / max(len(ideas), 1) * 100)
 
+    if overdue:
+        return {
+            "class": "weather-fog",
+            "label": tx("山间浓雾", "山間に濃霧"),
+            "summary": tx(
+                f"{len(overdue)} 条反馈已超过首次回应时限，建议今天明确负责人。",
+                f"{len(overdue)}件が初回回答期限を超えています。本日中に担当者を明確にしましょう。",
+            ),
+            "meta": tx(
+                f"超时 {len(overdue)} 条 · 回应率 {response_rate}%",
+                f"期限超過 {len(overdue)}件 · 回答率 {response_rate}%",
+            ),
+        }
     if len(high_unanswered) >= 2:
         return {
             "class": "weather-fog",
@@ -2012,6 +2312,14 @@ def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool 
     merged_html = ""
     if idea.get("merged_into_id"):
         merged_html = f'<div class="management-response"><strong>{tx("已合并到主议题", "主要テーマに統合済み")}</strong><br>{tx("原始反馈仍被保留，后续进展请查看主议题。", "元の声は保存されています。今後の進捗は主要テーマをご覧ください。")}</div>'
+    sla = response_sla_info(idea)
+    deadline_text = sla["deadline"].astimezone().strftime("%Y-%m-%d %H:%M")
+    sla_html = (
+        f'<div class="sla-strip {sla["state"]}">'
+        f'<strong>{html.escape(sla["label"])}</strong>'
+        f'<span>{html.escape(sla["detail"])}'
+        f' · {tx("目标", "期限")} {deadline_text}</span></div>'
+    )
 
     st.html(
         f"""
@@ -2030,6 +2338,7 @@ def render_idea_card(idea: dict, show_actions: bool = False, allow_delete: bool 
             <span class="tag">{tx("赞同", "共感")} {idea["votes"]}</span>
             <span class="tag">{html.escape(idea["created_at"])}</span>
             <div class="heat-breakdown">{factor_html}</div>
+            {sla_html}
             {response_html}
             {merged_html}
             {action_html}
@@ -2063,11 +2372,92 @@ def render_status_timeline(idea: dict) -> None:
     st.html(f'<div class="status-timeline">{"".join(entries)}</div>')
 
 
+RESOLUTION_RATING_LABELS = {
+    "resolved": ("已解决", "解決した"),
+    "partial": ("部分解决", "一部解決"),
+    "unresolved": ("未解决", "未解決"),
+}
+
+
+def resolution_rating_label(rating: str) -> str:
+    zh, ja = RESOLUTION_RATING_LABELS.get(rating, (rating, rating))
+    return tx(zh, ja)
+
+
+def render_resolution_rating(idea: dict, data: dict) -> None:
+    if idea.get("status") != "已完成" or idea.get("merged_into_id"):
+        return
+    counts = idea.get("resolution_counts") or {"resolved": 0, "partial": 0, "unresolved": 0}
+    total = sum(int(counts.get(key, 0) or 0) for key in RESOLUTION_RATING_LABELS)
+    score = round(
+        (
+            int(counts.get("resolved", 0) or 0)
+            + int(counts.get("partial", 0) or 0) * 0.5
+        )
+        / max(total, 1)
+        * 100
+    )
+    summary = "".join(
+        f'<span class="tag">{resolution_rating_label(key)} {int(counts.get(key, 0) or 0)}</span>'
+        for key in RESOLUTION_RATING_LABELS
+    )
+    with st.expander(
+        tx("这个结果真的解决问题了吗？", "この結果で本当に解決しましたか？"),
+        expanded=False,
+    ):
+        st.html(
+            f'<div class="resolution-summary">{summary}'
+            f'<span class="tag">{tx("员工解决度", "解決実感")} {score if total else "--"}%</span></div>'
+        )
+        if not data.get("_resolution_ratings_available", True):
+            st.info(
+                tx(
+                    "评价功能等待数据库升级，管理员运行最新 SQL 后即可开放。",
+                    "評価機能はデータベース更新後に利用できます。",
+                )
+            )
+            return
+        current = str(idea.get("my_resolution_rating") or "")
+        options = list(RESOLUTION_RATING_LABELS)
+        default_index = options.index(current) if current in options else 0
+        with st.form(f'resolution_rating_{idea["id"]}'):
+            selected = st.radio(
+                tx("你的评价", "あなたの評価"),
+                options,
+                index=default_index,
+                horizontal=True,
+                format_func=resolution_rating_label,
+            )
+            submit_rating = st.form_submit_button(
+                tx("提交结果评价", "評価を送信"),
+                use_container_width=True,
+            )
+        if submit_rating:
+            try:
+                changed = persist_resolution_rating(idea, selected, get_session_token(), data)
+                st.session_state["pending_toast"] = tx(
+                    "结果评价已更新。" if changed else "你的评价没有变化。",
+                    "評価を更新しました。" if changed else "評価に変更はありません。",
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(tx(f"评价保存失败：{exc}", f"評価を保存できませんでした：{exc}"))
+
+
 def finalize_idea_submission(data: dict, idea: dict) -> None:
     data["ideas"].insert(0, idea)
     persist_new_idea(data, idea)
+    notification_status = send_new_feedback_notification(idea)
+    if notification_status == "failed":
+        st.session_state["pending_notification_warning"] = tx(
+            "反馈已保存，但邮件通知发送失败，请检查 Gmail 配置。",
+            "声は保存されましたが、メール通知の送信に失敗しました。Gmail 設定を確認してください。",
+        )
     st.session_state.pop("pending_similar_submission", None)
-    st.session_state["pending_toast"] = tx("反馈已提交。", "声を受け付けました。")
+    st.session_state["pending_toast"] = tx(
+        "反馈已提交，已通知管理者。" if notification_status == "sent" else "反馈已提交。",
+        "声を受け付け、管理者に通知しました。" if notification_status == "sent" else "声を受け付けました。",
+    )
     st.query_params["view"] = "workspace"
     st.query_params["page"] = "progress"
     st.rerun()
@@ -2286,11 +2676,24 @@ def render_translator(data: dict) -> None:
                 unsafe_allow_html=True,
             )
 
+        translator_delete_code = st.text_input(
+            tx("删除码（4位数字，提交后无法查看）", "削除コード（4桁の数字、投稿後は確認できません）"),
+            key="translator_delete_code",
+            max_chars=4,
+            type="password",
+            placeholder=tx("请设置一个只有你知道的4位数字", "自分だけが知っている4桁の数字を設定してください"),
+        )
+        st.caption(tx("之后如需删除这条反馈，需要输入这个删除码。", "後で削除する場合、この削除コードが必要です。"))
+
         if st.button("把转译结果送入查看进度", key="send_translator_result", use_container_width=True):
+            if not translator_delete_code.strip().isdigit() or len(translator_delete_code.strip()) != 4:
+                st.warning(tx("请先设置4位数字删除码。", "先に4桁の数字の削除コードを設定してください。"))
+                return
             created_at = now_str()
+            translated_id = f"idea-{uuid4().hex[:8]}"
             translated_idea = normalize_idea(
                 {
-                    "id": f"idea-{uuid4().hex[:8]}",
+                    "id": translated_id,
                     "title": result["title"],
                     "category": result["category"],
                     "author": "AI 转译",
@@ -2302,6 +2705,7 @@ def render_translator(data: dict) -> None:
                     "heat": preview_idea["heat"],
                     "votes": 1,
                     "created_at": created_at,
+                    "delete_code_hash": hash_delete_code(translator_delete_code.strip(), translated_id),
                     "history": [
                         {
                             "from_status": "",
@@ -2314,15 +2718,11 @@ def render_translator(data: dict) -> None:
                     ],
                 }
             )
-            data["ideas"].insert(0, translated_idea)
-            persist_new_idea(data, translated_idea)
             st.session_state.pop("translator_result", None)
             st.session_state.pop("translator_raw", None)
             st.session_state.pop("translator_target", None)
-            st.session_state["pending_toast"] = "已送入查看进度列表。"
-            st.query_params["view"] = "workspace"
-            st.query_params["page"] = "progress"
-            st.rerun()
+            st.session_state.pop("translator_delete_code", None)
+            finalize_idea_submission(data, translated_idea)
 
 
 def render_task_card(task: dict) -> None:
@@ -2784,6 +3184,16 @@ def render_admin_management(data: dict) -> None:
     selected_label = st.selectbox(tx("选择反馈", "対象の声"), list(idea_options), key="admin_selected_idea")
     selected_id = idea_options[selected_label]
     idea = next(item for item in data["ideas"] if item["id"] == selected_id)
+    selected_sla = response_sla_info(idea)
+    if selected_sla["state"] == "overdue":
+        st.error(
+            tx(
+                f"这条反馈{selected_sla['detail']}，发布正式回应后将停止计时。",
+                f"この声は{selected_sla['detail']}です。正式回答を公開すると計測が終了します。",
+            )
+        )
+    elif selected_sla["state"] == "pending":
+        st.info(f"{selected_sla['label']} · {selected_sla['detail']}")
     statuses = ["待确认", "已受理", "推进中", "已完成", "暂缓"]
     current_index = statuses.index(idea["status"]) if idea["status"] in statuses else 0
     with st.form(f'admin_manage_{idea["id"]}'):
@@ -2845,6 +3255,36 @@ def render_admin_management(data: dict) -> None:
         st.rerun()
 
 
+def render_progress_idea(idea: dict, data: dict) -> None:
+    render_idea_card(idea, show_actions=True, allow_delete=True)
+    render_status_timeline(idea)
+    render_resolution_rating(idea, data)
+
+
+def render_progress_metrics(ideas: list[dict]) -> None:
+    active = [idea for idea in ideas if idea.get("status") not in {"已完成", "已合并"}]
+    overdue = [idea for idea in active if idea_is_overdue(idea)]
+    awaiting = [idea for idea in active if not idea.get("management_response")]
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    recently_updated = [idea for idea in ideas if idea_last_updated_at(idea) >= recent_cutoff]
+    rated = sum(sum((idea.get("resolution_counts") or {}).values()) for idea in ideas)
+    columns = st.columns(4)
+    columns[0].metric(tx("超时待回应", "回答期限超過"), len(overdue))
+    columns[1].metric(tx("等待首次回应", "初回回答待ち"), len(awaiting))
+    columns[2].metric(tx("近 7 天有更新", "7日以内の更新"), len(recently_updated))
+    columns[3].metric(tx("结果评价", "結果評価"), rated)
+
+
+def render_focus_group(title: str, ideas: list[dict], data: dict, shown: set[str], limit: int = 3) -> None:
+    selected = [idea for idea in ideas if idea["id"] not in shown][:limit]
+    if not selected:
+        return
+    st.markdown(f'<div class="progress-focus-title">{html.escape(title)}</div>', unsafe_allow_html=True)
+    for idea in selected:
+        shown.add(idea["id"])
+        render_progress_idea(idea, data)
+
+
 def render_feedback_progress(data: dict) -> None:
     st.markdown(f'<div class="section-title">{tx("查看进度", "進捗を見る")}</div>', unsafe_allow_html=True)
     st.caption(tx("这里展示已经提交的反馈和正在推进的事项。", "届けられた声と、現在進んでいる案件を確認できます。"))
@@ -2873,14 +3313,107 @@ def render_feedback_progress(data: dict) -> None:
     if not data["ideas"]:
         st.info(tx('还没有反馈。可以先到“提交反馈”写下第一条。', 'まだ声がありません。「声を届ける」から最初の投稿を書いてみましょう。'))
         return
-    render_admin_management(data)
-    categories = ["全部"] + sorted({i["category"] for i in data["ideas"]})
-    selected = st.segmented_control(tx("反馈类型", "カテゴリ"), categories, default="全部", format_func=lambda value: tx("全部", "すべて") if value == "全部" else ui_value(value))
-    for idea in data["ideas"]:
-        if selected != "全部" and idea["category"] != selected:
-            continue
-        render_idea_card(idea, show_actions=True, allow_delete=True)
-        render_status_timeline(idea)
+
+    ideas = [idea for idea in data["ideas"] if not idea.get("merged_into_id")]
+    render_progress_metrics(ideas)
+    if is_admin():
+        with st.expander(tx("打开管理层处理台", "管理層対応デスクを開く"), expanded=False):
+            render_admin_management(data)
+
+    view_mode = st.segmented_control(
+        tx("浏览方式", "表示"),
+        ["focus", "all"],
+        default="focus",
+        format_func=lambda value: tx("重点动态", "注目の動き") if value == "focus" else tx("全部反馈", "すべての声"),
+        key="progress_view_mode",
+    )
+
+    if view_mode == "focus":
+        active = [idea for idea in ideas if idea.get("status") not in {"已完成", "已合并"}]
+        overdue = sorted(
+            [idea for idea in active if idea_is_overdue(idea)],
+            key=idea_response_deadline,
+        )
+        followed = sorted(
+            [idea for idea in ideas if idea["id"] in liked_idea_ids()],
+            key=idea_last_updated_at,
+            reverse=True,
+        )
+        recent = sorted(active, key=idea_last_updated_at, reverse=True)
+        completed = sorted(
+            [idea for idea in ideas if idea.get("status") == "已完成"],
+            key=idea_last_updated_at,
+            reverse=True,
+        )
+        shown: set[str] = set()
+        render_focus_group(tx("超过回应时限", "回答期限を超過"), overdue, data, shown)
+        render_focus_group(tx("我关注的反馈", "共感した声"), followed, data, shown)
+        render_focus_group(tx("最近有更新", "最近の更新"), recent, data, shown)
+        render_focus_group(tx("已完成，等待结果评价", "完了・結果評価待ち"), completed, data, shown, limit=2)
+        if not shown:
+            st.success(tx("当前没有需要特别关注的动态。", "現在、特に注意が必要な動きはありません。"))
+    else:
+        controls = st.columns([1.6, 0.9, 0.9, 0.9])
+        keyword = controls[0].text_input(
+            tx("搜索反馈", "声を検索"),
+            placeholder=tx("搜索标题、内容或建议", "タイトル・内容・提案を検索"),
+        ).strip().casefold()
+        categories = ["全部"] + sorted({idea["category"] for idea in ideas})
+        selected_category = controls[1].selectbox(
+            tx("类型", "カテゴリ"),
+            categories,
+            format_func=lambda value: tx("全部", "すべて") if value == "全部" else ui_value(value),
+        )
+        statuses = ["全部"] + ["待确认", "已受理", "推进中", "已完成", "暂缓"]
+        selected_status = controls[2].selectbox(
+            tx("状态", "ステータス"),
+            statuses,
+            format_func=lambda value: tx("全部", "すべて") if value == "全部" else ui_value(value),
+        )
+        sort_mode = controls[3].selectbox(
+            tx("排序", "並び順"),
+            ["updated", "heat", "newest", "sla"],
+            format_func=lambda value: {
+                "updated": tx("最近更新", "最近の更新"),
+                "heat": tx("热度最高", "注目度順"),
+                "newest": tx("最新提交", "新着順"),
+                "sla": tx("回应最紧急", "回答期限順"),
+            }[value],
+        )
+        filtered = []
+        for idea in ideas:
+            searchable = " ".join(
+                str(idea.get(key) or "")
+                for key in ("title", "content", "impact", "category", "author")
+            ).casefold()
+            if keyword and keyword not in searchable:
+                continue
+            if selected_category != "全部" and idea["category"] != selected_category:
+                continue
+            if selected_status != "全部" and idea["status"] != selected_status:
+                continue
+            filtered.append(idea)
+        if sort_mode == "heat":
+            filtered.sort(key=lambda idea: int(idea.get("heat", 0) or 0), reverse=True)
+        elif sort_mode == "newest":
+            filtered.sort(
+                key=lambda idea: parse_timestamp(idea.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+        elif sort_mode == "sla":
+            filtered.sort(
+                key=lambda idea: (
+                    response_sla_info(idea)["state"] != "overdue",
+                    idea_response_deadline(idea),
+                )
+            )
+        else:
+            filtered.sort(key=idea_last_updated_at, reverse=True)
+        st.caption(tx(f"找到 {len(filtered)} 条反馈", f"{len(filtered)}件の声"))
+        if not filtered:
+            st.info(tx("没有符合当前条件的反馈。", "条件に一致する声はありません。"))
+        for idea in filtered:
+            render_progress_idea(idea, data)
 
     with st.expander(tx("事项处理进度", "案件の進捗"), expanded=False):
         render_tasks(data)
@@ -2929,6 +3462,23 @@ CONSTELLATION_COLORS = {
     "成长发展": "#60d394",
     "综合建议": "#cbd5e1",
 }
+
+
+def constellation_curve_path(left: dict, right: dict, variant: int = 0) -> str:
+    dx = right["x"] - left["x"]
+    dy = right["y"] - left["y"]
+    distance = max(math.hypot(dx, dy), 1.0)
+    bend = min(7.5, max(2.5, distance * 0.22))
+    if variant % 2:
+        bend *= -1
+    normal_x = -dy / distance
+    normal_y = dx / distance
+    control_x = (left["x"] + right["x"]) / 2 + normal_x * bend
+    control_y = (left["y"] + right["y"]) / 2 + normal_y * bend
+    return (
+        f'M {left["x"]:.1f} {left["y"]:.1f} '
+        f'Q {control_x:.1f} {control_y:.1f} {right["x"]:.1f} {right["y"]:.1f}'
+    )
 
 
 def build_constellations(ideas: list[dict]) -> list[dict]:
@@ -3001,8 +3551,9 @@ def render_star_page(data: dict) -> None:
         impact = html.escape(idea["impact"])
         created_at = html.escape(idea["created_at"])
         color = status_color(idea["status"])
+        star_size = 10 + round(max(0, min(100, int(idea.get("heat", 0) or 0))) / 25)
         star_items.append(
-            f'<a class="sp-star" href="#{detail_id}" style="left:{x}%; top:{y}%;" title="{title}">{title}</a>'
+            f'<a class="sp-star" href="#{detail_id}" style="left:{x}%; top:{y}%; --star-size:{star_size}px;" title="{title}">{title}</a>'
         )
         detail_cards.append(
             f"""
@@ -3026,10 +3577,11 @@ def render_star_page(data: dict) -> None:
     constellation_panel_items = []
     for constellation in constellations:
         color = constellation["color"]
-        for left, right in constellation["pairs"]:
+        for pair_index, (left, right) in enumerate(constellation["pairs"]):
+            path = constellation_curve_path(left, right, pair_index)
             constellation_lines.append(
-                f'<line x1="{left["x"]}%" y1="{left["y"]}%" x2="{right["x"]}%" y2="{right["y"]}%" '
-                f'stroke="{color}" stroke-width="1.4" stroke-linecap="round" />'
+                f'<path class="sp-constellation-glow" d="{path}" stroke="{color}" />'
+                f'<path class="sp-constellation-curve" d="{path}" stroke="{color}" />'
             )
         constellation_labels.append(
             f"""
@@ -3260,8 +3812,8 @@ def render_star_page(data: dict) -> None:
         .sp-star {{
             position: absolute;
             z-index: 3;
-            width: 14px;
-            height: 14px;
+            width: var(--star-size, 14px);
+            height: var(--star-size, 14px);
             border-radius: 999px;
             background: #f8fbff;
             box-shadow: 0 0 10px rgba(255,255,255,0.95), 0 0 24px rgba(94,234,212,0.65);
@@ -3282,8 +3834,21 @@ def render_star_page(data: dict) -> None:
             z-index: 2;
             width: 100%;
             height: 100%;
-            opacity: 0.62;
+            opacity: 0.78;
             pointer-events: none;
+        }}
+        .sp-constellation-curve,
+        .sp-constellation-glow {{
+            fill: none;
+            stroke-linecap: round;
+        }}
+        .sp-constellation-curve {{
+            stroke-width: 0.38;
+            stroke-opacity: 0.70;
+        }}
+        .sp-constellation-glow {{
+            stroke-width: 1.35;
+            stroke-opacity: 0.13;
         }}
         .sp-constellation-label {{
             position: absolute;
@@ -4208,6 +4773,13 @@ def render_settings_panel() -> None:
     st.caption(f"Gemini 默认模型：{gemini_model}")
     st.markdown("**数据存储**")
     st.caption(f"Supabase：{'已配置' if supabase_url and supabase_key else '未配置，当前使用本地 JSON'}")
+    st.markdown("**消息通知**")
+    notification_ready = bool(
+        get_secret_value("GMAIL_SENDER_EMAIL")
+        and get_secret_value("GMAIL_APP_PASSWORD")
+        and notification_recipients()
+    )
+    st.caption(f"Gmail 新反馈通知：{'已配置' if notification_ready else '未配置'}")
 
 
 def render_admin_login() -> None:
@@ -4345,7 +4917,7 @@ def main() -> None:
         page_title=f"{APP_TITLE} · 反馈与跟进",
         page_icon="✨",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="auto",
     )
     query_language = st.query_params.get("lang", "")
     if query_language in LANGUAGE_OPTIONS.values():
@@ -4366,6 +4938,9 @@ def main() -> None:
     pending_toast = st.session_state.pop("pending_toast", "")
     if pending_toast:
         st.toast(pending_toast)
+    pending_notification_warning = st.session_state.pop("pending_notification_warning", "")
+    if pending_notification_warning:
+        st.warning(pending_notification_warning)
     if "view" not in st.session_state:
         st.session_state["view"] = "landing"
     qv = st.query_params.get("view")
